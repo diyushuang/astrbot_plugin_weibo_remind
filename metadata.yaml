@@ -1,0 +1,13 @@
+name: astrbot_plugin_weibo_remind
+display_name: 微博定时提醒
+desc: 定时抓取指定微博账号的新微博，自动解析正文中的中文时间描述（今晚8点、明天下午3点、X月X日、1030 等），按配置的提前分钟档位通过 OneBot 机器人定时推送提醒到 QQ 群。
+short_desc: 抓取微博并解析正文时间，到点/提前多档提醒推送 QQ 群
+version: v0.3.2
+author: diyushuang
+repo: https://github.com/diyushuang/astrbot_plugin_weibo_remind
+# 下界 4.24：插件的日志走 v4.28+ 的按插件日志器工厂，且主动推送依赖
+#          context.send_message 的现有签名，低于该线未做过验证。
+# 上界收在 5：未针对 v5 做过任何验证；不写上界会让 v5 直接放行。
+astrbot_version: ">=4.24,<5"
+support_platforms:
+  - aiocqhttp

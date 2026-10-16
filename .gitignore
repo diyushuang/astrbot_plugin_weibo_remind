@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# 本地虚拟环境
+.venv/
+venv/
+
+# 打包产物（发布走 GitHub Release 或手动分发，zip 不进仓库）
+dist/
+build/
+*.zip
+
+# 运行时数据（AstrBot 实际落盘在 data/plugin_data/ 下，这里只防本地调试残留）
+data/
+*.db
+*.db-journal
+
+# 本地工具与临时数据
+.mimosa/
+.zcode/
+.zcodeignore
+.playwright-mcp/
+_test_data/
+
+# 工作记忆与本地校验脚本（内部资料，不进仓库）
+.workbuddy/
+
+# 破坏性操作前的整仓备份
+backup/
+
+# 敏感信息
+.env
+.env.*
+*.session
+# 运行时/调试残留（AstrBot 正常落盘在 data/plugin_data/，这里只防本机调试产物）
+*.jsonl
+*.log
+*.sqlite3
+*.bak
+*.orig
+coverage.json
+
+# 操作系统垃圾文件
+.DS_Store
+Thumbs.db
+desktop.ini

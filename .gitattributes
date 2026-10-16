@@ -1,0 +1,4 @@
+* text=auto eol=lf
+
+# 测试语料等数据文件不做行尾转换，避免 diff 噪音
+tests/corpus/*.json text eol=lf

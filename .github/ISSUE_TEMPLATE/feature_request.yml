@@ -1,0 +1,63 @@
+name: 功能建议
+description: 希望新增的解析格式、推送能力或指令
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢建议。请尽量说清**真实场景**：你看到的微博长什么样、希望插件怎么做。
+        时间解析类建议如果附上原文，我们可以直接加进回归夹具。
+
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 使用场景
+      description: 你在什么情况下需要这个功能？现在的做法是什么、哪里不方便？
+    validations:
+      required: true
+
+  - type: textarea
+    id: expectation
+    attributes:
+      label: 期望行为
+      description: 你希望插件具体怎么做（输入什么、输出什么）
+      placeholder: |
+        例：微博正文写「10月17日 10:00 直播」，希望提前 30 分钟也提醒一次
+    validations:
+      required: true
+
+  - type: textarea
+    id: samples
+    attributes:
+      label: 相关微博原文（解析类建议必填）
+      description: 把希望支持的微博正文贴在这里；若已有解析结果不符预期，附上「微博提醒 测试」的输出
+      render: text
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 涉及范围
+      options:
+        - 时间解析（新格式 / 解析更准）
+        - 提醒档位与推送策略
+        - @全体成员
+        - 指令与配置项
+        - 覆盖自检与统计
+        - 文档
+        - 其他
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已确认 README 的「局限与已知约束」里没有说明该行为是刻意设计
+          required: true
+        - label: 我愿意在需要时提供更多真实样本协助回归
+          required: false

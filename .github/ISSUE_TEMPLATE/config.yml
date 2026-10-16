@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用问题与排障（先看 README）
+    url: https://github.com/diyushuang/astrbot_plugin_weibo_remind#常见问题
+    about: 收不到提醒、时间解析不准、@全体 不生效等，多半在「常见问题」与「局限与已知约束」里已有结论。
+  - name: 安全漏洞（请勿公开）
+    url: https://github.com/diyushuang/astrbot_plugin_weibo_remind/security/advisories/new
+    about: 安全问题请走私下上报渠道，不要开公开 Issue，详见 SECURITY.md。

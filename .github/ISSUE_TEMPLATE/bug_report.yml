@@ -1,0 +1,109 @@
+name: Bug 反馈
+description: 收不到提醒、解析不准、@全体 异常、指令报错等功能性问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。本项目完全由 AI 生成，**证据比描述更有用**——请尽量把日志原文贴全，我们据此把结论重新钉一遍。
+
+        安全类问题请**不要**在这里公开，改走 [SECURITY.md](../SECURITY.md) 的私下渠道。
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: 插件版本
+      description: 在群里发送「微博提醒 状态」即可看到首行版本号
+      placeholder: 例如 v0.3.0
+    validations:
+      required: true
+
+  - type: input
+    id: astrbot-version
+    attributes:
+      label: AstrBot 版本
+      placeholder: 例如 v4.28.2
+    validations:
+      required: true
+
+  - type: input
+    id: protocol
+    attributes:
+      label: 协议端与版本
+      description: NapCat / Lagrange 等，以及版本号
+      placeholder: 例如 NapCat v4.9.81（Docker，与 AstrBot 分容器部署）
+    validations:
+      required: true
+
+  - type: dropdown
+    id: problem-type
+    attributes:
+      label: 问题类型
+      options:
+        - 完全收不到提醒（群里没有任何消息）
+        - 提醒发出但时间不对（解析错）
+        - 该提醒的没提醒（漏检）
+        - 不该提醒的提醒了（误报）
+        - @全体成员 不生效 / 炸群太多
+        - 指令报错或没有响应
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 现象
+      description: 你期望发生什么、实际发生了什么。涉及提醒时请说明**群里收到的原文**（含时间行）
+    validations:
+      required: true
+
+  - type: textarea
+    id: weibo-text
+    attributes:
+      label: 相关微博原文
+      description: 解析/漏检类问题**必须**附上微博正文原文（可以直接复制）。解析是纯函数，有原文就能复现
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: parse-test
+    attributes:
+      label: 「微博提醒 测试」的输出
+      description: 在群里发送「微博提醒 测试 <微博里的时间片段>」，把返回的解析结果贴在这里
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志片段
+      description: AstrBot 日志里相关的一段原文（含报错行）。建议连上下文一起贴，带上时间戳
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: config-diff
+    attributes:
+      label: 与默认值不同的配置项
+      description: 只需列出改过的项，例如 at_all=true、poll_interval=60
+      placeholder: at_all=true
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我使用的是最新版本（旧版本的问题请先升级再复现）
+          required: true
+        - label: 我已读过 README 的「常见问题」与「局限与已知约束」，确认不是已知行为
+          required: true
+        - label: 我已确认日志里没有暴露 Cookie、代理凭据等敏感信息
+          required: true

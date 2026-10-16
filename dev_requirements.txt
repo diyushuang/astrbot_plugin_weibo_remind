@@ -1,0 +1,6 @@
+# 开发与测试依赖（不随插件分发，安装插件时不会被读取）
+#
+# 用法：pip install -r dev_requirements.txt
+ruff>=0.6          # 静态检查与格式化（提交前必跑）
+pytest>=8.0         # 测试框架
+pytest-asyncio>=0.23  # 异步用例（pytest.ini 里 asyncio_mode = auto）

@@ -1,0 +1,143 @@
+{
+  "uid": {
+    "description": "【必填】监控的微博账号 UID（个人主页 weibo.com/u/ 后面的数字）",
+    "type": "string",
+    "default": "6902546888",
+    "hint": "默认监控 UID 6902546888；修改后需重载插件生效"
+  },
+  "poll_interval": {
+    "description": "【选填】轮询间隔（秒），最小 30",
+    "type": "int",
+    "default": 120,
+    "hint": "间隔越小越接近实时，但触发微博风控的概率越高；风控冷却期间自动暂停出网"
+  },
+  "check_window_minutes": {
+    "description": "【选填】只处理发布后多少分钟内抓到的微博（分钟）",
+    "type": "int",
+    "default": 720,
+    "hint": "防止首次建基线或翻页补漏时把陈年旧博当成新提醒；0 表示不限制"
+  },
+  "push_sessions": {
+    "description": "【选填】推送目标会话列表（unified_msg_origin，在群内发送 微博提醒 绑定 自动写入）",
+    "type": "list",
+    "default": []
+  },
+  "push_group_ids": {
+    "description": "【选填】手工填写的推送 QQ 群号列表（与 default_platform 拼成推送目标）",
+    "type": "list",
+    "default": [],
+    "hint": "适合不方便在群内发指令的场景；与绑定指令写入的会话自动合并去重"
+  },
+  "default_platform": {
+    "description": "【选填】push_group_ids 对应的平台实例 ID",
+    "type": "string",
+    "default": "aiocqhttp",
+    "hint": "AstrBot 平台适配器的 ID，默认 aiocqhttp（OneBot/QQ）"
+  },
+  "remind_advance_minutes": {
+    "description": "【必填】提前提醒档位（分钟列表），0 表示到点提醒",
+    "type": "list",
+    "default": [60, 10, 0],
+    "hint": "每个识别出的时间点按每个档位各推送一次；例如 [60,10,0] 表示提前 1 小时、提前 10 分钟、到点各推一次。抓到微博时已经过去的档位自动跳过"
+  },
+  "max_future_days": {
+    "description": "【选填】解析出的时间超过多少天则不创建任务",
+    "type": "int",
+    "default": 60
+  },
+  "max_tasks_per_post": {
+    "description": "【选填】单条微博最多创建的时间点任务数",
+    "type": "int",
+    "default": 3,
+    "hint": "一条微博正文里可能提到多个时间，按时间先后取前 N 个建任务"
+  },
+  "date_only_default_hour": {
+    "description": "【选填】仅日期无时刻时（如「10月30日发售」）的默认提醒时刻（时，0-23）",
+    "type": "int",
+    "default": 9,
+    "hint": "jionlp 对纯日期默认解析为当天 0 点，凌晨提醒通常不合适，默认改为上午 9 点；填 24 之类非法值时按 9 处理"
+  },
+  "push_on_parse_fail": {
+    "description": "【选填】微博含疑似时间但解析失败时，推送原文请群友自行注意",
+    "type": "bool",
+    "default": true,
+    "hint": "解析失败 ≠ 没有时间：开启时按 parse_fail_template 推送原文；关闭时仅记录日志。解析出的时间已经过去的情况一律静默跳过"
+  },
+  "remind_template": {
+    "description": "【必填】定时提醒推送模板",
+    "type": "text",
+    "default": "⏰ 微博提醒\n【{name}】{source}\n⏱ 事件时间：{event_time}\n⌛ 提前 {advance}\n📝 {weibo}\n🔗 {link}",
+    "hint": "占位符：{name} 博主昵称、{source} 命中的时间原文、{event_time} 事件时间、{advance} 提前分钟（到点档显示“到点”）、{weibo} 微博正文、{link} 原微博链接；\\n 表示换行"
+  },
+  "parse_fail_template": {
+    "description": "【选填】解析失败推送模板（push_on_parse_fail 开启时生效）",
+    "type": "text",
+    "default": "📢 {name} 发了新微博，提到时间安排但未能自动识别，请自行注意确认\n📝 {weibo}\n🔗 {link}",
+    "hint": "占位符同上（无 {source}/{event_time}/{advance}）"
+  },
+  "custom_cookie": {
+    "description": "【选填】自定义微博 Cookie（正常情况留空，插件完全免 Cookie 运行）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "留空时插件自动向微博游客系统换取匿名身份（无需登录）；填写后直接使用此 Cookie（格式 k1=v1; k2=v2），失效需自行更换。修改后需重载插件生效"
+  },
+  "proxy": {
+    "description": "【选填】HTTP(S) 代理地址，如 http://127.0.0.1:7890",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "海外/VPS 部署建议配置国内出口代理以降低风控概率；本机部署留空直连。修改后需重载插件生效"
+  },
+  "request_timeout": {
+    "description": "【选填】单个微博接口请求超时（秒）",
+    "type": "int",
+    "default": 15
+  },
+  "message_send_timeout": {
+    "description": "【选填】单条推送消息发送超时（秒），0 表示不限制",
+    "type": "int",
+    "default": 60,
+    "hint": "防止单个平台适配器无响应时卡住调度任务"
+  },
+  "missed_remind_grace_minutes": {
+    "description": "【选填】插件/AstrBot 重启后，错过的提醒在多少分钟内补发（标注补发）",
+    "type": "int",
+    "default": 10,
+    "hint": "超过该时长的过期任务标记为 missed 不再推送；0 表示重启后一律不补发"
+  },
+  "at_all": {
+    "description": "【选填】提醒推送时 @全体成员（仅群聊生效）",
+    "type": "bool",
+    "default": false,
+    "hint": "需要机器人在目标群有管理员权限：普通成员发不出 @全体，部分协议端会整条消息发送失败（插件检测到后会去掉 @ 重发一次，保证正文照常到群）。群里也可用「微博提醒 全体 开/关」动态切换"
+  },
+  "at_all_advance_minutes": {
+    "description": "【选填】只对这些提前档位 @全体（分钟列表，0 表示到点）",
+    "type": "list",
+    "default": [0],
+    "hint": "默认只 @「到点」那一档：多档提醒会各推一次，全带上 @ 等于一小时内连炸三次群。留空列表表示不限档位（每档都 @）"
+  },
+  "at_all_keywords": {
+    "description": "【选填】只有正文或命中原文含这些关键词时才 @全体",
+    "type": "list",
+    "default": [],
+    "hint": "留空 = 不限关键词；填了则只对命中的微博 @，例如填「直播 首播」"
+  },
+  "at_all_daily_limit": {
+    "description": "【选填】每天 @全体 的次数上限，0 表示不限制",
+    "type": "int",
+    "default": 5,
+    "hint": "QQ 对 @全体 有频率限制，超限可能被临时禁止或触发风控。达到上限后自动降级为普通提醒（内容照发，只是不 @）；计数按上海时区的自然日重置，可在「微博提醒 状态」里查看今日已用次数"
+  },
+  "text_max_length": {
+    "description": "【选填】推送/快照正文的摘要最大长度（字符数，超出截断加省略号）",
+    "type": "int",
+    "default": 500
+  },
+  "debug_parse": {
+    "description": "【选填】调试：记录每条微博的时间解析候选明细到日志",
+    "type": "bool",
+    "default": false
+  }
+}

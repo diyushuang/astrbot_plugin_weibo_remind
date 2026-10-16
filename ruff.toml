@@ -1,0 +1,11 @@
+# 沿用 astrbot_plugin_image_trace 的 ruff 配置口径
+target-version = "py310"
+line-length = 100
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+# 测试文件允许 assert、魔术比较
+"tests/*" = ["B011", "SIM117"]
