@@ -45,4 +45,6 @@ jobs:
           ruff format --check .
 
       - name: 全量用例
-        run: python -m pytest -q
+        # 不要在这里再加 -q：pytest.ini 的 addopts 已有 -q，叠加成 -qq 会把
+        # 「N passed」汇总行也压掉，CI 日志里就看不到实际跑了多少用例。
+        run: python -m pytest
