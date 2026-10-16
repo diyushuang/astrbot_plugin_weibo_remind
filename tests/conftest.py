@@ -10,6 +10,7 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -17,7 +18,15 @@ PLUGIN_DIR = Path(__file__).resolve().parent.parent
 if str(PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR))
 
-TZ = None  # 由被测模块内部统一使用 Asia/Shanghai
+# 插件全流程按上海时区解释正文时间（constants.TZ_CN）。用例构造时间也必须显式带
+# 这个时区：裸 naive datetime 的 .timestamp() 跟随**运行机器的本地时区**，
+# CI（UTC）与本地开发机（UTC+8）会差 8 小时，在北京时间深夜还会走到不同的分支。
+CN = ZoneInfo("Asia/Shanghai")
+
+
+def now_cn() -> datetime:
+    """当前时刻（上海时区，带 tzinfo）。用例里不要用裸 datetime.now()。"""
+    return datetime.now(tz=CN)
 
 
 @pytest.fixture

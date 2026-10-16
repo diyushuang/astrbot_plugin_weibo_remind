@@ -39,13 +39,43 @@ README 徽章四处保持一致。
 - **故障注入验证**：移除回退逻辑后，新用例立刻失败
   （`AttributeError ... has no attribute 'logger'`），恢复后通过。
 
+### CI 首轮矩阵暴露的另外两处问题（同版本内修复）
+
+矩阵第一次跑，两个 job 都红，各暴露一个问题：
+
+1. **CI 自己的探针写错了**（下限 job 的「安装依赖」步骤失败）。该步骤末尾加了一行
+   `python -c "import astrbot; print(astrbot.__version__)"` 想打印实际装到的版本，
+   但 astrbot 模块**没有 `__version__` 属性**（4.24.5 实测 `AttributeError`）——
+   依赖其实装成功了，是探针把整个 job 判成失败。改用 `importlib.metadata.version`。
+
+2. **用例依赖运行机器的时区**（最新 job 的「全量用例」失败）：
+   `test_advance_tier_already_passed_is_skipped` 报
+   `assert 60 not in [60, 10, 0]`。根因是用例用裸 `datetime.now()` 构造时间，
+   而 `_post()` 里的 `created.timestamp()` 会**跟随运行机器的本地时区**；
+   插件却始终按 `constants.TZ_CN`（Asia/Shanghai）解释正文时间。
+   CI 跑在 UTC，与插件假设差 8 小时：北京时间深夜 23:43 时，事件时刻被判成
+   「前夜发次日排期」而顺延到第二天 → 三个档位全建。
+
+   **为什么本地一直没发现**：开发机本身就是 UTC+8，与插件假设一致，缺陷被环境掩盖。
+
+   修法：`tests/conftest.py` 新增 `CN` 与显式带时区的 `now_cn()`；`_post()` 把 naive
+   datetime 一律按上海时区归一；`tests/test_integration.py` 与
+   `tests/test_package_load.py` 驱动脚本里的时间构造全部改用上海时区。
+   **这是纯测试修复，产品行为不变**，但用例从此在任何时区的机器上都等价。
+
+   **故障注入验证**：把用例改回裸 `datetime.now()` 后，`TZ=UTC` 下立刻复现
+   `assert 60 not in [60, 10, 0]`（与 CI 报错逐字一致），而本地时区下仍通过——
+   证明它确实只在与插件时区不一致的环境下暴露。
+
 ### 验证矩阵
 
 | 环境 | 结果 |
 | --- | --- |
-| astrbot 4.24.5（声明下限） | 全量用例通过 |
-| astrbot 4.28.2（本地开发环境） | 全量用例通过 |
-| astrbot 4.29.0（PyPI 最新，CI） | 全量用例通过 |
+| astrbot 4.24.5（声明下限）· 本地时区 | 全量用例通过 |
+| astrbot 4.24.5（声明下限）· `TZ=UTC` | 全量用例通过 |
+| astrbot 4.28.2（本地开发环境）· 本地时区 | 全量用例通过 |
+| astrbot 4.28.2 · `TZ=UTC` | 全量用例通过 |
+| astrbot 4.29.0（PyPI 最新，CI 矩阵一端） | 全量用例通过 |
 
 ## v0.3.2
 

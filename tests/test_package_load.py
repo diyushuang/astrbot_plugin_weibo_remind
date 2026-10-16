@@ -28,6 +28,9 @@ DRIVER = """
 import asyncio, importlib, sys, time
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+CN = ZoneInfo("Asia/Shanghai")  # 插件按上海时区解释正文时间，用例须一致
 
 root = sys.argv[1]
 sys.path.insert(0, root)          # 只暴露 AstrBot 式根目录，插件目录不可顶层导入
@@ -59,11 +62,11 @@ async def main():
     mod.RemindScheduler.run = noop_run
     await p.initialize()
     try:
-        dt = datetime.fromtimestamp(time.time() + 5 * 86400)
+        dt = datetime.fromtimestamp(time.time() + 5 * 86400, tz=CN)
         post = mod.WeiboPost(
             id="pkg-1", uid="6902546888", author="麦报的小行家",
             link="https://weibo.com/6902546888/pkg1",
-            created_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
+            created_at=datetime.fromtimestamp(time.time(), tz=CN).strftime("%Y-%m-%d %H:%M"),
             created_ts=time.time(),
             text="📢商务物料\\n发布规划\\n⏰" + str(dt.month) + "月" + str(dt.day) + "日\\n10:00 邀约试驾视频",
             is_retweet=False, orig_text="",

@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timedelta
 
 import pytest
+from conftest import CN, now_cn
 
 from fetcher import WeiboPost
 from main import WeiboRemindPlugin
@@ -32,6 +33,14 @@ class FakeContext:
 
 
 def _post(pid: str, text: str, created: datetime) -> WeiboPost:
+    """构造一条微博；created 以**上海时区**为准。
+
+    必须归一到带时区的 datetime：插件全流程按 `constants.TZ_CN` 解释正文时间，
+    而裸 naive datetime 的 `.timestamp()` 跟随**运行机器的本地时区**。
+    CI（UTC）与本地开发机（UTC+8）因此相差 8 小时，曾导致用例在 CI 上失败。
+    """
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=CN)
     return WeiboPost(
         id=pid,
         uid="6902546888",
@@ -91,7 +100,7 @@ async def test_full_flow_creates_multi_tier_tasks_and_pushes(tmp_path, plugin, m
     fresh_post = _post(
         "p-new",
         "📢商务物料 / 发布规划 / ⏰10月17日 / 10:00 邀约试驾视频",
-        datetime.now().replace(tzinfo=None),
+        now_cn(),
     )
     rounds: list[list[WeiboPost]] = [[old], [fresh_post, old]]
 
@@ -134,7 +143,7 @@ async def test_full_flow_creates_multi_tier_tasks_and_pushes(tmp_path, plugin, m
 async def test_baseline_backfills_recent_post(plugin, monkeypatch):
     """首次运行：时效窗口内的最新公告要解析出任务，窗口外的历史帖只记已见。"""
     old = _post("p-history", "10月17日 20:00 直播", datetime(2026, 10, 1, 10, 0))
-    recent = _post("p-recent", "明天下午3点直播", datetime.now().replace(tzinfo=None))
+    recent = _post("p-recent", "明天下午3点直播", now_cn())
     monkeypatch.setattr(
         "fetcher.WeiboFetcher.fetch_timeline", lambda self, uid, known_ids=None: _ret([recent, old])
     )
@@ -171,7 +180,7 @@ async def test_parse_failure_pushes_original_text(plugin, monkeypatch):
     vague = _post(
         "p-vague",
         "📢《无可替代》发布节奏 / 具体时间后续公布 / 请大家留意",
-        datetime.now().replace(tzinfo=None),
+        now_cn(),
     )
     monkeypatch.setattr(
         "fetcher.WeiboFetcher.fetch_timeline", lambda self, uid, known_ids=None: _ret([vague])
@@ -188,7 +197,7 @@ async def test_parse_failure_pushes_original_text(plugin, monkeypatch):
 
 async def test_plain_post_is_silent(plugin, monkeypatch):
     """日常博文（不含时间安排）→ 静默，不推送。"""
-    plain = _post("p-plain", "今天天气不错，大家早安", datetime.now().replace(tzinfo=None))
+    plain = _post("p-plain", "今天天气不错，大家早安", now_cn())
     await plugin.initialize()
     try:
         assert await plugin._process_post(plain) == 0
@@ -220,7 +229,7 @@ async def test_plain_post_is_silent(plugin, monkeypatch):
 async def test_non_schedule_posts_are_silent(plugin, pid, text, kind):
     """建议博/打假声明/日常博不得触发「解析失败推原文」——实测语料里这类占 20/98，
     按原策略会被当疑似时间推给群友，是纯噪音。"""
-    post = _post(pid, text, datetime.now().replace(tzinfo=None))
+    post = _post(pid, text, now_cn())
     await plugin.initialize()
     try:
         assert await plugin._process_post(post) == 0
@@ -234,11 +243,11 @@ async def test_non_schedule_posts_are_silent(plugin, pid, text, kind):
 
 async def test_pending_schedule_post_pushes_original(plugin, monkeypatch):
     """明说「时间待定」的排期博文：没有可用时间点，但要推原文让群友知道有安排。"""
-    past = datetime.now() - timedelta(days=3)
+    past = now_cn() - timedelta(days=3)
     post = _post(
         "p-pending",
         f"通知📢\n@无可替代官微\n\n{past.month}月{past.day}日 官宣杀青物料\n\n具体发布待定。",
-        datetime.now().replace(tzinfo=None),
+        now_cn(),
     )
     await plugin.initialize()
     try:
@@ -255,7 +264,7 @@ async def test_schedule_post_without_any_time_pushes_original(plugin, monkeypatc
     post = _post(
         "p-notime",
         "📢通知\n@无可替代官微\n\n官宣杀青物料，具体节奏稍后同步给大家。",
-        datetime.now().replace(tzinfo=None),
+        now_cn(),
     )
     await plugin.initialize()
     try:
@@ -270,7 +279,7 @@ async def test_coverage_records_tasked_and_coverage_percent(plugin, monkeypatch)
     post = _post(
         "p-cover",
         "📢商务物料 / 发布规划 / ⏰10月17日 / 10:00 邀约试驾视频",
-        datetime.now().replace(tzinfo=None),
+        now_cn(),
     )
     await plugin.initialize()
     try:
@@ -298,7 +307,7 @@ async def test_old_post_outside_window_is_skipped(plugin, monkeypatch):
 
 async def test_advance_tier_already_passed_is_skipped(plugin, monkeypatch):
     """抓到微博时离事件不足 60 分钟 → 提前 60 档静默跳过，其余照建。"""
-    now = datetime.now()
+    now = now_cn()
     event = now + timedelta(minutes=30)
     if event.date() != now.date():
         pytest.skip("临近午夜，跨日场景不适用本用例")
@@ -315,7 +324,7 @@ async def test_advance_tier_already_passed_is_skipped(plugin, monkeypatch):
 
 async def test_restart_resends_missed_within_grace(tmp_path, plugin, monkeypatch):
     """重启后：宽限内的错过提醒补发（带补发标记），超期作废。"""
-    post = _post("p-restart", "10月17日 20:00 直播", datetime.now().replace(tzinfo=None))
+    post = _post("p-restart", "10月17日 20:00 直播", now_cn())
     await plugin.initialize()
     try:
         await plugin._process_post(post)
@@ -426,7 +435,7 @@ async def test_push_with_at_all_end_to_end(plugin):
     post = _post(
         "p-atall",
         "📢商务物料 / 发布规划 / " + _future_text() + " / 10:00 邀约试驾视频",
-        datetime.now(),
+        now_cn(),
     )
     plugin.config["at_all"] = True
     plugin.config["at_all_advance_minutes"] = [0]
@@ -449,7 +458,7 @@ async def test_push_with_at_all_end_to_end(plugin):
 
 def _future_text() -> str:
     """构造未来日期文本（月日），避免用例依赖运行日期。"""
-    dt = datetime.now() + timedelta(days=5)
+    dt = now_cn() + timedelta(days=5)
     return f"{dt.month}月{dt.day}日"
 
 

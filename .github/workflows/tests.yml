@@ -35,7 +35,9 @@ jobs:
           python -m pip install -r requirements.txt -r dev_requirements.txt
           # 用例里的包路径/真实加载检查需要 astrbot 本体
           python -m pip install "${{ matrix.astrbot }}"
-          python -c "import astrbot; print('astrbot', astrbot.__version__)"
+          # 用 importlib.metadata 取版本：astrbot 模块本身没有 __version__
+          # 属性（4.24.5 实测 AttributeError），直接取会让安装步骤误判失败。
+          python -c "from importlib.metadata import version; print('astrbot', version('astrbot'))"
 
       - name: 代码风格
         run: |
