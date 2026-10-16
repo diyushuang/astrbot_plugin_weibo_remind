@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
@@ -125,6 +126,11 @@ class WeiboRemindPlugin(Star):
         # 写成必填会让「无配置」这条加载路径直接 TypeError
         super().__init__(context)
         self.config = config or {}
+        # Star 自 v4.26.8 起才在 __init__ 里注入 self.logger；v4.24 ~ v4.26.0 没有该属性，
+        # 直接取会让插件在加载阶段抛 AttributeError（整个插件装不上，且不会自愈）。
+        # 这里退回 astrbot 的标准日志器，使声明的下限版本真正可用。
+        if getattr(self, "logger", None) is None:
+            self.logger = logger
         self.store: SQLiteStore | None = None
         self.parser = WeiboTimeParser(self.config, self.logger)
         self.fetcher: WeiboFetcher | None = None

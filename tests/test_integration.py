@@ -451,3 +451,40 @@ def _future_text() -> str:
     """构造未来日期文本（月日），避免用例依赖运行日期。"""
     dt = datetime.now() + timedelta(days=5)
     return f"{dt.month}月{dt.day}日"
+
+
+# ---------------- 声明下限的 AstrBot 兼容性 ----------------
+
+
+def test_constructs_when_star_injects_no_logger(monkeypatch):
+    """回归：Star 在 v4.26.8 之前不注入 self.logger，构造期不能因此崩溃。
+
+    真实症状（CI 抓到）：工作流用 Python 3.11 + `pip install astrbot`，
+    因 astrbot>=4.19.5 要求 Python>=3.12，pip 一路回退装到 4.14.6；
+    该版本 Star 没有 logger 属性，构造期取 self.logger 直接 AttributeError,
+    插件在加载阶段就起不来（且不会自愈）。此处用一个"不注入 logger 的 Star"
+    复刻该形态——修复后应能退回 astrbot 的标准日志器正常构造。
+    """
+    from astrbot.api.star import Star
+
+    def bare_init(self, context):  # 模拟旧版 Star：只存 context，不注入 logger
+        self.context = context
+
+    monkeypatch.setattr(Star, "__init__", bare_init)
+    inst = WeiboRemindPlugin(context=FakeContext(), config={})
+    assert inst.logger is not None, "缺少 logger 时应退回标准日志器，而不是崩溃"
+
+
+def test_logger_is_kept_when_star_provides_one(monkeypatch):
+    """反向用例：Star 注入了 logger 时必须原样保留，不能被回退逻辑覆盖。"""
+    from astrbot.api.star import Star
+
+    sentinel = object()
+
+    def init_with_logger(self, context):  # 模拟 v4.26.8+ 的行为
+        self.context = context
+        self.logger = sentinel
+
+    monkeypatch.setattr(Star, "__init__", init_with_logger)
+    inst = WeiboRemindPlugin(context=FakeContext(), config={})
+    assert inst.logger is sentinel

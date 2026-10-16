@@ -10,11 +10,11 @@
 
 | 依赖 | 说明 |
 | --- | --- |
-| Python | 3.10+（`ruff.toml` 的 `target-version` 为 py310），本地开发用 3.13 亦可 |
+| Python | **3.12+**。AstrBot ≥4.19.5 的 `requires_python` 就是 ≥3.12，用 3.10/3.11 会让 pip 一路回退到 4.14.6（低于本插件声明下限）而装不上。`ruff.toml` 的 `target-version` 保留 `py310` 只是限制语法特性，不代表能在 3.10 上运行 |
 | ruff | 静态检查与格式化，配置见 `ruff.toml` |
 | pytest / pytest-asyncio | 用例运行器（`pytest.ini` 里 `asyncio_mode = auto`） |
 | jionlp | 运行期依赖，跑时间解析相关用例必须有 |
-| AstrBot | 真机联调时需要（≥ 4.24；本仓库以 4.28.2 实测）。用例本身不依赖它——只有 `tests/test_package_load.py` 会真的 import `astrbot`，没有 AstrBot 环境时它会失败 |
+| AstrBot | 真机联调时需要（声明 `>=4.24,<5`；**下限 4.24.5 与最新版都已实测通过**，CI 也按这两个版本跑矩阵）。用例本身不依赖它——只有 `tests/test_package_load.py` 会真的 import `astrbot`，没有 AstrBot 环境时它会失败 |
 
 ```bash
 pip install -r requirements.txt -r dev_requirements.txt

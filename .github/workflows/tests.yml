@@ -7,19 +7,35 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      # 两个版本都跑完再判失败，便于一次看清是哪一端坏了
+      fail-fast: false
+      matrix:
+        include:
+          # 声明的支持下限：验证 metadata.yaml 的 astrbot_version 不是空头支票
+          - astrbot: "astrbot==4.24.5"
+            label: "下限 4.24"
+          # PyPI 最新：防止只盯下限、被新版 API 变更打得措手不及
+          - astrbot: "astrbot"
+            label: "最新"
+    name: test (${{ matrix.label }})
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          # 必须 >= 3.12：astrbot >= 4.19.5 的 requires_python 就是 >=3.12。
+          # 用 3.11 会让 pip 一路回退到 4.14.6（低于本插件的声明下限），
+          # 等于在测一个明确不支持的版本，结果没有意义。
+          python-version: "3.12"
 
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r dev_requirements.txt
           # 用例里的包路径/真实加载检查需要 astrbot 本体
-          python -m pip install astrbot
+          python -m pip install "${{ matrix.astrbot }}"
+          python -c "import astrbot; print('astrbot', astrbot.__version__)"
 
       - name: 代码风格
         run: |
