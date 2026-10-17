@@ -60,6 +60,38 @@ def test_sessions_empty_by_default(log):
     assert Pusher(None, {}, log).sessions() == []
 
 
+# ---------------- 免打扰时段（v0.4.1）----------------
+
+
+def test_quiet_hours_parsed_from_config(log):
+    p = Pusher(None, {"quiet_hours": "23:00-08:00"}, log)
+    assert p.quiet() is not None and p.quiet().spec == "23:00-08:00"
+    assert Pusher(None, {}, log).quiet() is None
+    assert Pusher(None, {"quiet_hours": "乱填"}, log).quiet() is None
+
+
+async def test_parse_fail_push_skipped_in_quiet_hours(log, monkeypatch):
+    """解析失败提示是「非定时消息」，免打扰时段内直接跳过（顺延无意义）。"""
+    ctx = FakeContext()
+    config = {"push_sessions": ["aiocqhttp:GroupMessage:111"], "quiet_hours": "23:00-08:00"}
+    p = Pusher(ctx, config, log)
+    monkeypatch.setattr(Pusher, "in_quiet_hours", lambda self: True)
+
+    assert await p.send_parse_fail("麦报", "正文", "https://x") is False
+    assert ctx.calls == [], "免打扰时段内不该发出任何消息"
+
+
+async def test_broadcast_respects_quiet_flag(log):
+    """respect_quiet=False 时不受免打扰限制（用于需要立即送达的场景）。"""
+    ctx = FakeContext()
+    config = {"push_sessions": ["aiocqhttp:GroupMessage:111"], "quiet_hours": "23:00-08:00"}
+    p = Pusher(ctx, config, log)
+
+    ok, total = await p.broadcast("测试", respect_quiet=False)
+    assert (ok, total) == (1, 1)
+    assert len(ctx.calls) == 1
+
+
 def test_render_remind_placeholders(log, task):
     config = {
         "remind_template": "【{name}】{source} 事件{event_time} 提前{advance}\n{weibo}\n{link}"
@@ -321,3 +353,16 @@ async def test_parse_fail_push_never_at_all(log):
 async def test_send_remind_success_requires_a_target(log, task):
     config = {"push_sessions": ["aiocqhttp:GroupMessage:1"]}
     assert await Pusher(FakeContext(), config, log).send_remind(task) is True
+
+
+def test_render_remind_marks_deferred_task(log, task):
+    """免打扰顺延过来的任务，文案要标注「顺延提醒」，且优先级低于补发。"""
+    p = Pusher(None, {}, log)
+    assert "顺延提醒" not in p.render_remind(task)
+
+    task.snapshot = {**task.snapshot, "deferred": True}
+    assert "顺延提醒" in p.render_remind(task)
+
+    # 同时是补发时以补发为准（顺延后的 trigger_at 在未来，理论上不会同时成立）
+    out = p.render_remind(task, is_makeup=True)
+    assert "补发提醒" in out and "顺延提醒" not in out

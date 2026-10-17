@@ -9,14 +9,18 @@ APScheduler 的 jobstore 以 pickle 存 callable，插件重载后 job 引用旧
 from __future__ import annotations
 
 import asyncio
+import random
 import time
+from datetime import datetime
 from typing import Any
 
 try:
-    from .constants import SCHEDULER_SCAN_INTERVAL
+    from .constants import SCHEDULER_SCAN_INTERVAL, TZ_CN
+    from .quiet_hours import QuietHours, parse_quiet_hours
     from .store import STATUS_FAILED, STATUS_MISSED, STATUS_PENDING, STATUS_SENDING, STATUS_SENT
 except ImportError:  # 独立脚本 / 测试环境
-    from constants import SCHEDULER_SCAN_INTERVAL  # type: ignore
+    from constants import SCHEDULER_SCAN_INTERVAL, TZ_CN  # type: ignore
+    from quiet_hours import QuietHours, parse_quiet_hours  # type: ignore
     from store import (  # type: ignore
         STATUS_FAILED,
         STATUS_MISSED,
@@ -28,6 +32,8 @@ except ImportError:  # 独立脚本 / 测试环境
 # 超过这个秒数才推送的任务视为「补发」（AstrBot 重启或长时间卡顿导致错过）
 MAKEUP_THRESHOLD = max(120.0, SCHEDULER_SCAN_INTERVAL * 3)
 SCAN_BATCH_LIMIT = 20
+# 免打扰顺延的任务在 scan_once 返回值里的状态（不入库，库里仍是 pending）
+STATUS_DEFERRED = "deferred"
 
 
 class RemindScheduler:
@@ -48,6 +54,30 @@ class RemindScheduler:
         self._is_paused = is_paused
         self._stop_event = asyncio.Event()
         self._stopped = False
+        self._quiet: QuietHours | None = self._load_quiet()
+
+    # ---------------- 配置 ----------------
+
+    def _load_quiet(self) -> QuietHours | None:
+        raw = self.config.get("quiet_hours")
+        quiet = parse_quiet_hours(raw)
+        if str(raw or "").strip() and quiet is None:
+            self.log.warning(f"quiet_hours 配置非法（{raw!r}），应为 HH:MM-HH:MM，免打扰时段未启用")
+        return quiet
+
+    def _int_cfg(self, key: str, default: int = 0) -> int:
+        try:
+            return max(0, int(self.config.get(key) or default))
+        except (TypeError, ValueError):
+            return default
+
+    def jitter_seconds(self) -> int:
+        """到点推送的随机抖动上限（秒）——同秒齐发容易被 QQ 判成刷屏。"""
+        return self._int_cfg("push_jitter_seconds", 0)
+
+    def interval_seconds(self) -> int:
+        """同一批到期任务之间的发送间隔（秒）。"""
+        return self._int_cfg("push_interval_seconds", 0)
 
     # ---------------- 重启恢复 ----------------
 
@@ -87,11 +117,37 @@ class RemindScheduler:
     # ---------------- 扫描与推送 ----------------
 
     async def scan_once(self, now_ts: float | None = None, limit: int = SCAN_BATCH_LIMIT):
-        """取一批到期任务并推送，返回 [(任务, 结果状态), ...]。"""
+        """取一批到期任务并推送，返回 [(任务, 结果状态), ...]。
+
+        顺序上先判免打扰：时段内的到期任务**不顺延到点直接发**，而是把
+        trigger_at 改成时段结束时刻、状态放回 pending（结果里记 deferred）。
+        顺延不再重复判定，时段结束后自然被下一轮扫描取到。
+        """
         now = time.time() if now_ts is None else now_ts
         tasks = await self.store.pop_due(now, limit=limit)
         results: list[tuple[Any, str]] = []
+        now_dt = datetime.fromtimestamp(now, tz=TZ_CN)
+        jitter = self.jitter_seconds()
+        interval = self.interval_seconds()
+        attempted = False
         for task in tasks:
+            # ① 免打扰时段：顺延到时段结束并标注，不深夜炸群也不丢提醒
+            if self._quiet is not None and self._quiet.contains(now_dt):
+                resume = self._quiet.end_after(now_dt)
+                await self.store.reschedule(task.id, resume.timestamp(), mark_deferred=True)
+                self.log.info(
+                    f"免打扰时段 {self._quiet.spec}：提醒顺延到 "
+                    f"{resume.strftime('%m-%d %H:%M')}（{task.author} {task.source_text}）"
+                )
+                results.append((task, STATUS_DEFERRED))
+                continue
+            # ② 抖动与间隔：防「同一秒连发多条」触发平台风控
+            if jitter > 0:
+                await asyncio.sleep(random.uniform(0, jitter))
+            if attempted and interval > 0:
+                await asyncio.sleep(interval)
+            attempted = True
+
             is_makeup = (now - task.trigger_at) > MAKEUP_THRESHOLD
             try:
                 ok = await self.pusher.send_remind(task, is_makeup=is_makeup)

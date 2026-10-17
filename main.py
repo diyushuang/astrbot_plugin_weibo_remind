@@ -158,6 +158,13 @@ class WeiboRemindPlugin(Star):
         self._data_dir = _resolve_data_dir()
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self.store = SQLiteStore(self._data_dir / DB_FILENAME)
+        # v0.4.0 之前的已见记录没有 uid 归属：旧版只支持单账号，
+        # 这些记录必然来自旧配置的那个 uid，启动时一次性归属过去
+        legacy_uid = self._uid()
+        if legacy_uid:
+            migrated = await self.store.migrate_legacy_uid(legacy_uid)
+            if migrated:
+                self.logger.info(f"已把 {migrated} 条旧版已见记录归属到原监控账号 uid={legacy_uid}")
         self.fetcher = WeiboFetcher(self.config, self.logger)
         await self.fetcher.start()
         self.pusher = Pusher(self.context, self.config, self.logger, counter=self.store)
@@ -174,10 +181,11 @@ class WeiboRemindPlugin(Star):
         self._poll_task = asyncio.create_task(self._poll_loop())
         self._sched_task = asyncio.create_task(self.scheduler.run())
 
-        uid = self._uid()
+        uids = self._uids()
         sessions = self.pusher.sessions()
         self.logger.info(
-            f"{PLUGIN_NAME} {PLUGIN_VERSION} 已启动：监控 uid={uid or '未配置'}，"
+            f"{PLUGIN_NAME} {PLUGIN_VERSION} 已启动：监控账号 {len(uids)} 个"
+            f"（{'、'.join(uids) if uids else '未配置'}），"
             f"轮询 {self._poll_interval()} 秒，推送目标 {len(sessions)} 个，"
             f"恢复待触发 {report['pending']} 条（中断复位 {report['recovered']}，"
             f"超期作废 {report['missed']}）"
@@ -215,8 +223,26 @@ class WeiboRemindPlugin(Star):
             return default
 
     def _uid(self) -> str:
+        """旧版单账号配置（v0.4.0 前的字段），仅作兼容读取。"""
         raw = str(self.config.get("uid") or "").strip()
         return raw if raw.isdigit() else ""
+
+    def _uids(self) -> list[str]:
+        """监控账号列表：新配置 uids（列表）∪ 旧配置 uid（字符串），去重保序。
+
+        只保留纯数字项；两个来源都为空时返回空列表（本轮跳过抓取）。
+        """
+        out: list[str] = []
+        raw_list = self.config.get("uids")
+        if isinstance(raw_list, (list, tuple)):
+            for item in raw_list:
+                value = str(item or "").strip()
+                if value.isdigit() and value not in out:
+                    out.append(value)
+        legacy = self._uid()
+        if legacy and legacy not in out:
+            out.append(legacy)
+        return out
 
     def _poll_interval(self) -> int:
         return self._int_cfg("poll_interval", 120, minimum=POLL_MIN_INTERVAL)
@@ -278,35 +304,62 @@ class WeiboRemindPlugin(Star):
             self._kick.clear()
 
     async def _check_once(self) -> int:
-        """抓取一轮并处理新微博，返回新建任务数。"""
+        """抓取一轮（逐账号串行）并处理新微博，返回新建任务数。
+
+        单个账号失败只跳过该账号、不中断其它账号；全部账号都失败才按
+        整轮失败向外抛（让轮询进入退避）。账号间请求间隔由 fetcher 的
+        全局节流（REQUEST_GAP）保证，无需额外 sleep。
+        """
         assert self.fetcher is not None and self.store is not None
-        uid = self._uid()
-        if not uid:
+        uids = self._uids()
+        if not uids:
             self.logger.warning("未配置有效的微博 uid（应为纯数字），跳过本轮抓取")
             return 0
 
-        # 库里没有任何已见记录 = 首次运行
-        baseline = await self.store.seen_count() == 0
-        known = set() if baseline else await self.store.known_ids(SEEN_IDS_LIMIT)
-        posts = await self.fetcher.fetch_timeline(uid, known_ids=None if baseline else known)
+        total_created = 0
+        first_error: WeiboFetchError | None = None
+        failed = 0
+        for uid in uids:
+            try:
+                total_created += await self._check_uid_once(uid)
+            except asyncio.CancelledError:
+                raise
+            except WeiboFetchError as e:
+                failed += 1
+                if first_error is None:
+                    first_error = e
+                # 单账号失败不影响其它账号；若触发的是风控冷却，
+                # 后续账号会在冷却检查处快速失败，无害
+                self.logger.warning(f"抓取 uid={uid} 失败（本轮跳过该账号）: {e}")
+        if failed == len(uids) and first_error is not None:
+            raise first_error
         self._stats["fetch_rounds"] += 1
         self._stats["last_fetch_ts"] = time.time()
+        return total_created
+
+    async def _check_uid_once(self, uid: str) -> int:
+        """抓取单个账号并处理新微博，返回新建任务数。"""
+        assert self.fetcher is not None and self.store is not None
+        # 该账号在库里没有任何已见记录 = 该账号的首次运行
+        baseline = await self.store.seen_count(uid) == 0
+        known = set() if baseline else await self.store.known_ids(SEEN_IDS_LIMIT, uid=uid)
+        posts = await self.fetcher.fetch_timeline(uid, known_ids=None if baseline else known)
         if not posts:
-            self.logger.info("本轮未取到微博（可能被风控或账号无公开微博）")
+            self.logger.info(f"uid={uid} 本轮未取到微博（可能被风控或账号无公开微博）")
             return 0
 
         if baseline:
-            return await self._handle_baseline(posts)
+            return await self._handle_baseline(posts, uid)
 
         fresh = [p for p in posts if p.id not in known]
         if not fresh:
             return 0
         self._stats["new_posts"] += len(fresh)
-        self.logger.info(f"发现 {len(fresh)} 条新微博，开始解析时间")
+        self.logger.info(f"uid={uid} 发现 {len(fresh)} 条新微博，开始解析时间")
         created = 0
         # 按发布先后处理（抓取结果是新→旧）
         for post in sorted(fresh, key=lambda p: p.created_ts):
-            await self.store.mark_seen([post.id], {post.id: post.created_ts})
+            await self.store.mark_seen([post.id], {post.id: post.created_ts}, uid=uid)
             created += await self._process_post(post)
         self._stats["tasks_created"] += created
         await self._flush_coverage()
@@ -317,8 +370,8 @@ class WeiboRemindPlugin(Star):
         if self.coverage is not None:
             await self.coverage.flush()
 
-    async def _handle_baseline(self, posts: list[WeiboPost]) -> int:
-        """首次运行：先把当前可见微博全部记为已见，再回补时效窗口内的那些。
+    async def _handle_baseline(self, posts: list[WeiboPost], uid: str) -> int:
+        """单个账号首次运行：先把当前可见微博全部记为已见，再回补时效窗口内的那些。
 
         全部记为已见是为了避免下次运行把历史微博当成新提醒而刷屏；
         但窗口内（默认 12 小时）的微博仍要解析——刚装好插件时，最新一条
@@ -326,13 +379,15 @@ class WeiboRemindPlugin(Star):
         """
         assert self.store is not None
         now = time.time()
-        await self.store.mark_seen([p.id for p in posts], {p.id: p.created_ts for p in posts})
+        await self.store.mark_seen(
+            [p.id for p in posts], {p.id: p.created_ts for p in posts}, uid=uid
+        )
         window = self._int_cfg("check_window_minutes", 720) * 60
         recent = [
             p for p in posts if not window or not p.created_ts or now - p.created_ts <= window
         ]
         self.logger.info(
-            f"首次运行：已记录 {len(posts)} 条可见微博为已见；"
+            f"uid={uid} 首次运行：已记录 {len(posts)} 条可见微博为已见；"
             f"其中 {len(recent)} 条在时效窗口内，将解析时间"
         )
         created = 0
@@ -551,9 +606,10 @@ class WeiboRemindPlugin(Star):
             if stats["next_trigger_at"]
             else "无"
         )
+        uids = self._uids()
         lines = [
             f"微博定时提醒 {PLUGIN_VERSION}",
-            f"监控账号：{self._uid() or '未配置'}",
+            f"监控账号：{'、'.join(uids) if uids else '未配置'}（{len(uids)} 个）",
             f"运行状态：{'已暂停' if self._paused else '运行中'}"
             f"｜轮询间隔 {self._poll_interval()} 秒",
             f"上次抓取：{last_fetch}｜累计轮次 {self._stats['fetch_rounds']}",
@@ -564,6 +620,9 @@ class WeiboRemindPlugin(Star):
             f"已见微博记录：{stats['seen_count']}",
             f"提前档位：{self._advance_minutes()}",
             f"推送目标：{len(self.pusher.sessions())} 个",
+            f"免打扰时段：{self.pusher.quiet().spec if self.pusher.quiet() else '未启用'}"
+            f"｜推送抖动 {self.scheduler.jitter_seconds() if self.scheduler else 0} 秒"
+            f"｜批内间隔 {self.scheduler.interval_seconds() if self.scheduler else 0} 秒",
             f"解析引擎：jionlp {'可用' if self.parser.jionlp_ready else '不可用（降级）'}",
             f"游客身份：{'有效' if self.fetcher and self.fetcher.visitor_alive else '待获取'}",
             f"风控冷却：{f'冷却中（剩余 {remaining} 秒）' if cooling else '正常'}",

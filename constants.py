@@ -13,7 +13,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 PLUGIN_NAME = "astrbot_plugin_weibo_remind"
-PLUGIN_VERSION = "v0.3.3"
+PLUGIN_VERSION = "v0.4.1"
 
 # ---------------- 微博接口 ----------------
 WEIBO_HOME_URL = "https://m.weibo.cn/"

@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 import pytest
 from conftest import CN, now_cn
 
-from fetcher import WeiboPost
+from fetcher import WeiboFetchError, WeiboPost
 from main import WeiboRemindPlugin
 from scheduler import RemindScheduler
 from store import STATUS_SENT
@@ -91,7 +91,11 @@ async def _noop():
 
 
 async def test_full_flow_creates_multi_tier_tasks_and_pushes(tmp_path, plugin, monkeypatch):
-    """新微博 → 识别出时间 → 多档建任务 → 到点推送。"""
+    """新微博 → 识别出时间 → 多档建任务 → 到点推送。
+
+    事件时间用「未来某天 10:00」而不是「今天 10:00」：后者在下午跑用例时
+    必然已被判为过期（既有用例的时间依赖缺陷，随手修掉）。
+    """
     old = _post(
         "p-old",
         "📢行程同步 / 10月10日 / 已结束的活动",
@@ -99,7 +103,7 @@ async def test_full_flow_creates_multi_tier_tasks_and_pushes(tmp_path, plugin, m
     )
     fresh_post = _post(
         "p-new",
-        "📢商务物料 / 发布规划 / ⏰10月17日 / 10:00 邀约试驾视频",
+        f"📢商务物料 / 发布规划 / ⏰{_future_text()} / 10:00 邀约试驾视频",
         now_cn(),
     )
     rounds: list[list[WeiboPost]] = [[old], [fresh_post, old]]
@@ -117,7 +121,7 @@ async def test_full_flow_creates_multi_tier_tasks_and_pushes(tmp_path, plugin, m
         assert await plugin._check_once() == 3
         tasks = await plugin.store.list_pending()
         assert [t.advance_minutes for t in tasks] == [60, 10, 0]
-        assert all(t.source_text == "10月17日 10:00" for t in tasks)
+        assert all(t.source_text == f"{_future_text()} 10:00" for t in tasks)
         assert all("邀约试驾视频" in t.weibo for t in tasks)
 
         # 把三档的触发时间全部改到过去，模拟到点
@@ -134,8 +138,9 @@ async def test_full_flow_creates_multi_tier_tasks_and_pushes(tmp_path, plugin, m
         assert len(sent) == 3
         assert sent[0][0] == "aiocqhttp:GroupMessage:123456"
         assert "微博提醒" in sent[0][1]
-        assert "2026-10-17 10:00" in sent[0][1]  # 事件时间
-        assert "10月17日 10:00" in sent[0][1]  # 命中原文
+        event_day = now_cn() + timedelta(days=5)
+        assert f"{event_day.year}-{event_day.month:02d}-{event_day.day:02d} 10:00" in sent[0][1]
+        assert f"{_future_text()} 10:00" in sent[0][1]  # 命中原文
     finally:
         await plugin.terminate()
 
@@ -278,7 +283,7 @@ async def test_coverage_records_tasked_and_coverage_percent(plugin, monkeypatch)
     """覆盖自检：排期类建出任务后，覆盖率统计要反映出来。"""
     post = _post(
         "p-cover",
-        "📢商务物料 / 发布规划 / ⏰10月17日 / 10:00 邀约试驾视频",
+        f"📢商务物料 / 发布规划 / ⏰{_future_text()} / 10:00 邀约试驾视频",
         now_cn(),
     )
     await plugin.initialize()
@@ -460,6 +465,132 @@ def _future_text() -> str:
     """构造未来日期文本（月日），避免用例依赖运行日期。"""
     dt = now_cn() + timedelta(days=5)
     return f"{dt.month}月{dt.day}日"
+
+
+# ---------------- 多账号监控（v0.4.0）----------------
+
+
+def test_uids_merges_new_and_legacy_config():
+    """uids 列表与旧版 uid 字段合并去重，剔除非数字项。"""
+    inst = WeiboRemindPlugin(
+        context=FakeContext(),
+        config={"uid": "111", "uids": ["222", "111", "bad", 333, "", " 222 "]},
+    )
+    assert inst._uids() == ["222", "111", "333"]
+    # 只剩旧字段 → 单账号（旧配置升级路径）
+    assert WeiboRemindPlugin(context=FakeContext(), config={"uid": "111"})._uids() == ["111"]
+    # 只剩新字段
+    assert WeiboRemindPlugin(context=FakeContext(), config={"uids": ["222"]})._uids() == ["222"]
+    # 全空
+    assert WeiboRemindPlugin(context=FakeContext(), config={})._uids() == []
+
+
+async def test_second_account_gets_own_baseline(plugin, monkeypatch):
+    """账号 A 已有已见记录时，新加的账号 B 首轮必须走自己的基线路径。
+
+    判定依据是 fetch_timeline 收到的 known_ids：基线轮传 None（不翻页），
+    非基线轮传该账号的已见集合。若基线仍按全局记录数判定（v0.3.x 行为），
+    B 的首轮会拿到 A 的已见集合，翻页边界判断就错了。
+    """
+    post_a = _post("a-seen", "今天天气不错", now_cn() - timedelta(hours=1))
+    post_b = _post("b-fresh", f"{_future_text()} 20:00 直播预告", now_cn())
+    calls: list[tuple[str, object]] = []
+
+    async def fake_fetch(self, uid, known_ids=None):
+        calls.append((uid, known_ids))
+        return [post_a] if uid == "6902546888" else [post_b]
+
+    monkeypatch.setattr("fetcher.WeiboFetcher.fetch_timeline", fake_fetch)
+    await plugin.initialize()
+    try:
+        # 第一轮：单账号 A → 基线（known_ids=None）
+        assert await plugin._check_once() == 0
+        assert calls[-1] == ("6902546888", None)
+        assert await plugin.store.seen_count("6902546888") == 1
+
+        # 第二轮：新增账号 B → A 走增量（known 非空），B 走自己的基线（None）
+        plugin.config["uids"] = ["6902546888", "99999"]
+        created = await plugin._check_once()
+        assert calls[-2] == ("6902546888", {"a-seen"})
+        assert calls[-1] == ("99999", None)
+        assert await plugin.store.seen_count("99999") == 1, "B 的帖子应记到 B 自己名下"
+        # B 的窗口内排期帖在基线回补中被解析建任务
+        assert created > 0
+        assert all(t.post_id == "b-fresh" for t in await plugin.store.list_pending())
+    finally:
+        await plugin.terminate()
+
+
+async def test_partial_fetch_failure_skips_only_that_account(plugin, monkeypatch):
+    """一个账号抓取失败只跳过它，其它账号照常；全部失败才按整轮失败抛错。"""
+    post_a = _post("a-ok", "今天天气不错", now_cn())
+    post_b = _post("b-ok", f"{_future_text()} 20:00 直播预告", now_cn())
+    state = {"fail_a": False}
+
+    async def fake_fetch(self, uid, known_ids=None):
+        if uid == "111" and state["fail_a"]:
+            raise WeiboFetchError("账号 A 挂了")
+        return [post_a] if uid == "111" else [post_b]
+
+    # fixture 里带的是旧版单账号字段，这里显式清掉，只测 uids 两个账号的情形
+    plugin.config.pop("uid", None)
+    plugin.config["uids"] = ["111", "99999"]
+    monkeypatch.setattr("fetcher.WeiboFetcher.fetch_timeline", fake_fetch)
+    await plugin.initialize()
+    try:
+        # 第一轮：两个账号都正常 → 各自建基线（B 窗口内排期帖回补建任务）
+        assert await plugin._check_once() > 0
+        assert await plugin.store.seen_count("111") == 1
+        assert await plugin.store.seen_count("99999") == 1
+
+        # 第二轮：A 抓取失败、B 正常 → 本轮不抛错，B 的增量照常（无新帖）
+        state["fail_a"] = True
+        assert await plugin._check_once() == 0
+    finally:
+        await plugin.terminate()
+
+
+async def test_all_accounts_failed_raises_for_backoff(plugin, monkeypatch):
+    """全部账号都失败 → 抛出首个错误，让轮询层进入退避。"""
+
+    async def fetch_fail(self, uid, known_ids=None):
+        raise WeiboFetchError("风控冷却中")
+
+    plugin.config["uids"] = ["111", "222"]
+    monkeypatch.setattr("fetcher.WeiboFetcher.fetch_timeline", fetch_fail)
+    await plugin.initialize()
+    try:
+        with pytest.raises(WeiboFetchError):
+            await plugin._check_once()
+    finally:
+        await plugin.terminate()
+
+
+async def test_status_lists_all_accounts(plugin):
+    """状态指令要列出全部监控账号。"""
+    plugin.config["uids"] = ["6902546888", "1234567890"]
+    await plugin.initialize()
+    try:
+        out = await _run_cmd(plugin, "cmd_status", _CmdEvent())
+        assert "6902546888" in out and "1234567890" in out
+        assert "（2 个）" in out
+    finally:
+        await plugin.terminate()
+
+
+async def test_legacy_uid_config_still_monitors(plugin, monkeypatch):
+    """旧配置（只有 uid 字段）升级后无需改动即可继续工作。"""
+    post = _post("p-legacy", f"{_future_text()} 20:00 直播预告", now_cn())
+    monkeypatch.setattr(
+        "fetcher.WeiboFetcher.fetch_timeline", lambda self, uid, known_ids=None: _ret([post])
+    )
+    await plugin.initialize()  # fixture 的 config 只有 uid=6902546888
+    try:
+        created = await plugin._check_once()
+        assert created > 0, "基线回补窗口内的排期帖应建任务"
+        assert await plugin.store.seen_count("6902546888") == 1, "已见记录归属到 legacy uid"
+    finally:
+        await plugin.terminate()
 
 
 # ---------------- 声明下限的 AstrBot 兼容性 ----------------

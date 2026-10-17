@@ -6,8 +6,8 @@ import time
 
 import pytest
 
-from scheduler import MAKEUP_THRESHOLD, RemindScheduler
-from store import STATUS_FAILED, STATUS_SENT, SQLiteStore
+from scheduler import MAKEUP_THRESHOLD, STATUS_DEFERRED, RemindScheduler
+from store import STATUS_FAILED, STATUS_PENDING, STATUS_SENT, SQLiteStore
 
 
 class FakePusher:
@@ -146,3 +146,117 @@ async def test_run_loop_stops_cleanly(store, config, log):
     sched.stop()
     await asyncio.wait_for(task, timeout=2.0)
     assert sched._stopped is True
+
+
+# ---------------- 防打扰 / 防风控（v0.4.1）----------------
+
+
+async def test_quiet_hours_defers_due_task(store, log):
+    """免打扰时段内到点的提醒 → 不推送，顺延到时段结束，状态回 pending。"""
+    from conftest import ts
+
+    config = {"missed_remind_grace_minutes": 10, "quiet_hours": "23:00-08:00"}
+    now = ts(2026, 10, 17, 23, 30)
+    await store.add_task("p1", now - 1, 0, {"weibo": "x", "author": "麦报"})
+    pusher = FakePusher()
+    sched = RemindScheduler(store, pusher, config, log)
+
+    results = await sched.scan_once(now_ts=now)
+    assert results[0][1] == STATUS_DEFERRED
+    assert pusher.calls == [], "免打扰时段内不该真的发消息"
+    tasks = await store.list_pending()
+    assert len(tasks) == 1, "顺延后仍是待触发，不能丢"
+    assert tasks[0].trigger_at == ts(2026, 10, 18, 8, 0)
+    assert tasks[0].snapshot.get("deferred") is True, "顺延标记要落库，供文案标注"
+
+    # 时段结束后的下一轮扫描：正常推送
+    results2 = await sched.scan_once(now_ts=ts(2026, 10, 18, 8, 1))
+    assert results2[0][1] == STATUS_SENT
+    assert len(pusher.calls) == 1
+
+
+async def test_outside_quiet_hours_pushes_normally(store, log):
+    from conftest import ts
+
+    config = {"quiet_hours": "23:00-08:00"}
+    now = ts(2026, 10, 17, 20, 0)
+    await store.add_task("p1", now - 1, 0, {"weibo": "x"})
+    pusher = FakePusher()
+    sched = RemindScheduler(store, pusher, config, log)
+
+    results = await sched.scan_once(now_ts=now)
+    assert results[0][1] == STATUS_SENT
+    assert len(pusher.calls) == 1
+
+
+async def test_invalid_quiet_hours_is_ignored(store, log):
+    """配置写错不该让调度失效：按未启用处理，照常推送。"""
+    config = {"quiet_hours": "晚上11点到早上8点"}
+    await store.add_task("p1", time.time() - 1, 0, {"weibo": "x"})
+    pusher = FakePusher()
+    sched = RemindScheduler(store, pusher, config, log)
+
+    assert sched._quiet is None
+    results = await sched.scan_once()
+    assert results[0][1] == STATUS_SENT
+
+
+async def test_jitter_and_interval_sleeps(store, log, monkeypatch):
+    """抖动每条一次、批内间隔从第二条起生效（防止同秒连发被平台风控）。"""
+    config = {"push_jitter_seconds": 10, "push_interval_seconds": 3}
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("scheduler.asyncio.sleep", fake_sleep)
+    now = time.time()
+    for i in range(3):
+        await store.add_task(f"p{i}", now - 1, 0, {"weibo": f"w{i}"})
+    sched = RemindScheduler(store, FakePusher(), config, log)
+
+    await sched.scan_once(now_ts=now)
+    assert len(sleeps) == 5, "3 条任务 = 3 次抖动 + 2 次间隔"
+    assert sleeps.count(3) == 2
+    assert all(0 <= s <= 10 for s in sleeps if s != 3)
+
+
+async def test_no_sleeps_when_disabled(store, log, monkeypatch):
+    """两项都关闭（默认）时不应引入任何等待。"""
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("scheduler.asyncio.sleep", fake_sleep)
+    now = time.time()
+    await store.add_task("p1", now - 1, 0, {"weibo": "x"})
+    sched = RemindScheduler(store, FakePusher(), {"quiet_hours": ""}, log)
+
+    await sched.scan_once(now_ts=now)
+    assert sleeps == []
+
+
+async def test_deferred_task_is_not_marked_missed_on_restart(store, log):
+    """顺延到未来的任务不应被重启恢复当成「超期错过」作废。
+
+    免打扰时段按「当前时刻」动态构造，避免用例绑死某一天而随日期失效。
+    """
+    from datetime import datetime
+
+    from conftest import CN
+
+    now = time.time()
+    clock = datetime.fromtimestamp(now, tz=CN)
+    spec = f"{(clock.hour - 1) % 24:02d}:00-{(clock.hour + 2) % 24:02d}:00"
+    config = {"missed_remind_grace_minutes": 10, "quiet_hours": spec}
+    await store.add_task("p1", now - 1, 0, {"weibo": "x"})
+    sched = RemindScheduler(store, FakePusher(), config, log)
+
+    results = await sched.scan_once(now_ts=now)
+    assert results[0][1] == STATUS_DEFERRED
+
+    report = await RemindScheduler(store, FakePusher(), config, log).recover_on_startup()
+    assert report["missed"] == 0
+    assert await store.pending_count() == 1
+    assert (await store.list_pending())[0].status == STATUS_PENDING

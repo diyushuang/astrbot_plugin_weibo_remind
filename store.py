@@ -39,7 +39,8 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS seen_posts (
     post_id       TEXT PRIMARY KEY,
     created_ts    REAL NOT NULL DEFAULT 0,
-    first_seen_ts REAL NOT NULL
+    first_seen_ts REAL NOT NULL,
+    uid           TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS remind_tasks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +61,14 @@ CREATE TABLE IF NOT EXISTS at_all_log (
     count INTEGER NOT NULL DEFAULT 0
 );
 """
+
+# seen_posts.uid 的索引必须在补列之后建（老库里索引先建会报 no such column）。
+_UID_INDEX = "CREATE INDEX IF NOT EXISTS idx_seen_uid ON seen_posts (uid)"
+
+# v0.4.0 起已见记录按监控账号（uid）区分：多账号各自独立判定「首次运行基线」，
+# 否则第二个账号的首轮会被误判成「有新微博」而整页刷屏。
+# 老库迁移：seen_posts 补 uid 列（默认空串），再由调用方把空串归属到旧配置的单账号。
+_LEGACY_ALTER = "ALTER TABLE seen_posts ADD COLUMN uid TEXT NOT NULL DEFAULT ''"
 
 
 @dataclass
@@ -136,6 +145,11 @@ class SQLiteStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            # v0.4.0 之前的库没有 uid 列（executescript 的 CREATE IF NOT EXISTS 不补列）
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(seen_posts)")}
+            if "uid" not in cols:
+                self._conn.execute(_LEGACY_ALTER)
+            self._conn.execute(_UID_INDEX)
 
     # ---------------- 生命周期 ----------------
 
@@ -155,39 +169,77 @@ class SQLiteStore:
     async def is_seen(self, post_id: str) -> bool:
         return await asyncio.to_thread(self._is_seen, post_id)
 
-    def _mark_seen(self, post_ids: list[str], created_map: dict[str, float]) -> None:
+    def _mark_seen(self, post_ids: list[str], created_map: dict[str, float], uid: str) -> None:
         now = time.time()
-        rows = [(pid, float(created_map.get(pid, 0.0)), now) for pid in post_ids]
+        rows = [(pid, float(created_map.get(pid, 0.0)), now, str(uid)) for pid in post_ids]
         if not rows:
             return
         with self._lock, self._conn:
             self._conn.executemany(
-                "INSERT OR IGNORE INTO seen_posts (post_id, created_ts, first_seen_ts) "
-                "VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO seen_posts (post_id, created_ts, first_seen_ts, uid) "
+                "VALUES (?, ?, ?, ?)",
                 rows,
             )
+            if uid:
+                # 已存在但 uid 为空的记录（老库迁移前被再次标记）补上归属；
+                # 已有归属的不覆盖——一条微博只属于一个账号，以首次记录为准
+                self._conn.executemany(
+                    "UPDATE seen_posts SET uid = ? WHERE post_id = ? AND uid = ''",
+                    [(str(uid), pid) for pid in post_ids],
+                )
 
-    async def mark_seen(self, post_ids: list[str], created_map: dict[str, float] | None = None):
-        await asyncio.to_thread(self._mark_seen, list(post_ids), dict(created_map or {}))
+    async def mark_seen(
+        self,
+        post_ids: list[str],
+        created_map: dict[str, float] | None = None,
+        uid: str = "",
+    ):
+        await asyncio.to_thread(self._mark_seen, list(post_ids), dict(created_map or {}), str(uid))
 
-    def _known_ids(self, limit: int) -> set[str]:
+    def _migrate_legacy_uid(self, uid: str) -> int:
+        """把 uid 为空的老已见记录归属到旧配置的单个监控账号。
+
+        旧版本只支持单账号，uid='' 的记录必然来自当时配置的那个 uid。
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute("UPDATE seen_posts SET uid = ? WHERE uid = ''", (str(uid),))
+        return cur.rowcount or 0
+
+    async def migrate_legacy_uid(self, uid: str) -> int:
+        return await asyncio.to_thread(self._migrate_legacy_uid, str(uid))
+
+    def _known_ids(self, limit: int, uid: str | None) -> set[str]:
+        sql = "SELECT post_id FROM seen_posts"
+        params: tuple[Any, ...] = ()
+        if uid is not None:
+            sql += " WHERE uid = ?"
+            params = (str(uid),)
+        sql += " ORDER BY first_seen_ts DESC LIMIT ?"
+        params = params + (int(limit),)
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT post_id FROM seen_posts ORDER BY first_seen_ts DESC LIMIT ?", (int(limit),)
-            ).fetchall()
+            rows = self._conn.execute(sql, params).fetchall()
         return {str(r["post_id"]) for r in rows}
 
-    async def known_ids(self, limit: int = 1000) -> set[str]:
-        """最近见过的微博 id 集合（供抓取层判断翻页边界）。"""
-        return await asyncio.to_thread(self._known_ids, limit)
+    async def known_ids(self, limit: int = 1000, uid: str | None = None) -> set[str]:
+        """最近见过的微博 id 集合（供抓取层判断翻页边界）。
 
-    def _seen_count(self) -> int:
+        uid=None 查全部账号（微博 id 全局唯一，仅供诊断）；多账号模式下
+        调用方应传入具体 uid，翻页边界只跟本账号的已见记录比较。
+        """
+        return await asyncio.to_thread(self._known_ids, limit, uid)
+
+    def _seen_count(self, uid: str | None = None) -> int:
+        sql = "SELECT COUNT(*) AS n FROM seen_posts"
+        params: tuple[Any, ...] = ()
+        if uid is not None:
+            sql += " WHERE uid = ?"
+            params = (str(uid),)
         with self._lock:
-            row = self._conn.execute("SELECT COUNT(*) AS n FROM seen_posts").fetchone()
+            row = self._conn.execute(sql, params).fetchone()
         return int(row["n"]) if row else 0
 
-    async def seen_count(self) -> int:
-        return await asyncio.to_thread(self._seen_count)
+    async def seen_count(self, uid: str | None = None) -> int:
+        return await asyncio.to_thread(self._seen_count, uid)
 
     def _prune_seen(self, keep: int) -> int:
         with self._lock, self._conn:
@@ -276,6 +328,47 @@ class SQLiteStore:
     async def mark(self, task_id: int, status: str) -> None:
         """更新任务状态（sent / skipped / missed / failed）。"""
         await asyncio.to_thread(self._mark, task_id, status)
+
+    def _reschedule(self, task_id: int, trigger_at: float, mark_deferred: bool) -> None:
+        with self._lock, self._conn:
+            if mark_deferred:
+                row = self._conn.execute(
+                    "SELECT snapshot FROM remind_tasks WHERE id = ?", (int(task_id),)
+                ).fetchone()
+                snapshot: dict[str, Any] = {}
+                if row is not None:
+                    try:
+                        loaded = json.loads(row["snapshot"]) or {}
+                    except (json.JSONDecodeError, TypeError):
+                        loaded = {}
+                    if isinstance(loaded, dict):
+                        snapshot = loaded
+                # 持久化「顺延过」标记：下一轮扫描是从库里重新读任务的，
+                # 只改内存对象会在那一轮丢掉这个事实，文案就没法标注了
+                snapshot["deferred"] = True
+                self._conn.execute(
+                    "UPDATE remind_tasks SET status = ?, trigger_at = ?, snapshot = ? WHERE id = ?",
+                    (
+                        STATUS_PENDING,
+                        float(trigger_at),
+                        json.dumps(snapshot, ensure_ascii=False),
+                        int(task_id),
+                    ),
+                )
+                return
+            self._conn.execute(
+                "UPDATE remind_tasks SET status = ?, trigger_at = ? WHERE id = ?",
+                (STATUS_PENDING, float(trigger_at), int(task_id)),
+            )
+
+    async def reschedule(
+        self, task_id: int, trigger_at: float, mark_deferred: bool = False
+    ) -> None:
+        """把任务放回 pending 并改触发时间（免打扰时段顺延用）。
+
+        mark_deferred=True 时在快照里记下「这条被顺延过」，供推送文案标注。
+        """
+        await asyncio.to_thread(self._reschedule, task_id, trigger_at, mark_deferred)
 
     def _pending(self, limit: int) -> list[RemindTask]:
         with self._lock:

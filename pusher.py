@@ -21,6 +21,7 @@ try:
         DEFAULT_REMIND_TEMPLATE,
         TZ_CN,
     )
+    from .quiet_hours import QuietHours, parse_quiet_hours
     from .time_parser import WeiboTimeParser
 except ImportError:  # 独立脚本 / 测试环境
     from constants import (  # type: ignore
@@ -28,9 +29,11 @@ except ImportError:  # 独立脚本 / 测试环境
         DEFAULT_REMIND_TEMPLATE,
         TZ_CN,
     )
+    from quiet_hours import QuietHours, parse_quiet_hours  # type: ignore
     from time_parser import WeiboTimeParser  # type: ignore
 
 MAKEUP_PREFIX = "⏰ 补发提醒（原定时间已过）\n"
+DEFERRED_PREFIX = "⏰ 顺延提醒（免打扰时段已过，原定时间未打扰）\n"
 
 
 class Pusher:
@@ -42,6 +45,22 @@ class Pusher:
         self.log = log
         # @全体 每日计数（通常是 SQLiteStore；测试可注入替身，None 表示不限额）
         self.counter = counter
+        self._quiet: QuietHours | None = parse_quiet_hours(config.get("quiet_hours"))
+
+    # ---------------- 免打扰 ----------------
+
+    def quiet(self) -> QuietHours | None:
+        """当前配置的免打扰时段（None 表示未开启）。"""
+        return self._quiet
+
+    def in_quiet_hours(self) -> bool:
+        """此刻是否处于免打扰时段。
+
+        定时提醒由调度层顺延（不在这里处理）；这条判定用于**非定时**的群发，
+        例如「解析失败推原文」「Cookie 失效告警」——它们没有「到点」语义，
+        顺延没有意义，深夜直接跳过并记日志。
+        """
+        return self._quiet is not None and self._quiet.contains(datetime.now(tz=TZ_CN))
 
     # ---------------- 目标会话 ----------------
 
@@ -152,7 +171,13 @@ class Pusher:
         }
         text = re.sub(r"\{[a-z_]+\}", lambda m: mapping.get(m.group(0), m.group(0)), template)
         text = self._normalize(text)
-        return f"{MAKEUP_PREFIX}{text}" if is_makeup else text
+        if is_makeup:
+            return f"{MAKEUP_PREFIX}{text}"
+        snapshot = getattr(task, "snapshot", None) or {}
+        if isinstance(snapshot, dict) and snapshot.get("deferred"):
+            # 免打扰时段顺延过来的：让群友知道这条本该更早到
+            return f"{DEFERRED_PREFIX}{text}"
+        return text
 
     def render_parse_fail(self, author: str, weibo: str, link: str) -> str:
         """渲染解析失败提示（含疑似时间安排但识别不出，交由群友确认）。"""
@@ -221,12 +246,19 @@ class Pusher:
             self.log.warning(f"带 @全体 发送失败，改为不带 @ 重发：{session}")
         return await self._send_chain(session, self._build_chain(text, at_all=False))
 
-    async def broadcast(self, text: str, *, at_all: bool = False) -> tuple[int, int]:
+    async def broadcast(
+        self, text: str, *, at_all: bool = False, respect_quiet: bool = True
+    ) -> tuple[int, int]:
         """向所有目标会话推送，返回（成功数, 总数）。
 
         注意 at_all 只对群聊会话生效（私聊没有 @全体 概念），由调用方按会话判定；
         这里仅在只有一个目标、且调用方明确要求时透传。
+        respect_quiet=True 时，免打扰时段内的群发直接跳过（非定时消息顺延无意义）。
         """
+        if respect_quiet and self.in_quiet_hours():
+            spec = self._quiet.spec if self._quiet else ""
+            self.log.info(f"免打扰时段 {spec}：跳过本条群发（{text.replace(chr(10), ' ')[:24]}）")
+            return 0, 0
         sessions = self.sessions()
         if not sessions:
             self.log.warning("尚未配置推送目标：请在群内发送「微博提醒 绑定」或填写 push_group_ids")

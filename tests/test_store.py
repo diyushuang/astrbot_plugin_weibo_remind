@@ -155,6 +155,91 @@ async def test_event_ts_prefers_snapshot_then_falls_back(store):
     assert tasks["p3"].event_ts == 1000.0
 
 
+# ---------------- 多账号（v0.4.0）----------------
+
+
+async def test_seen_is_scoped_by_uid(store):
+    """已见记录按账号区分：known_ids / seen_count 都只统计本账号的记录。"""
+    await store.mark_seen(["a1", "a2"], {"a1": 1.0, "a2": 2.0}, uid="111")
+    await store.mark_seen(["b1"], {"b1": 3.0}, uid="222")
+
+    assert await store.seen_count("111") == 2
+    assert await store.seen_count("222") == 1
+    assert await store.seen_count() == 3  # 不传 uid = 全部（诊断口径）
+    assert await store.known_ids(100, uid="111") == {"a1", "a2"}
+    assert await store.known_ids(100, uid="222") == {"b1"}
+    assert await store.known_ids(100) == {"a1", "a2", "b1"}
+
+
+async def test_empty_uid_account_still_tracks_seen(store):
+    """uid=''（未标注）的记录在按账号查询时不被计入——保证基线判定不误判。"""
+    await store.mark_seen(["legacy"], {"legacy": 1.0})  # 不传 uid
+    assert await store.seen_count("999") == 0, "空 uid 的老记录不属于任何新账号"
+
+
+async def test_migrate_legacy_uid_assigns_old_rows(store):
+    await store.mark_seen(["p1", "p2"])  # 老数据形态：无 uid
+    moved = await store.migrate_legacy_uid("6902546888")
+    assert moved == 2
+    assert await store.seen_count("6902546888") == 2
+    assert await store.migrate_legacy_uid("6902546888") == 0, "重复迁移应为 0"
+
+
+async def test_old_schema_db_upgrades_uid_column(tmp_path):
+    """v0.4.0 之前的库（无 uid 列）打开时要自动补列，老数据 uid=''。"""
+    import sqlite3
+
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        "CREATE TABLE seen_posts ("
+        "post_id TEXT PRIMARY KEY, created_ts REAL NOT NULL DEFAULT 0,"
+        "first_seen_ts REAL NOT NULL);"
+    )
+    conn.execute(
+        "INSERT INTO seen_posts (post_id, created_ts, first_seen_ts) VALUES ('old1', 1, 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    s = SQLiteStore(db)
+    try:
+        # 打开即迁移：老记录可读、uid 为空串
+        assert await s.seen_count() == 1
+        assert await s.seen_count("any") == 0
+        assert await s.migrate_legacy_uid("6902546888") == 1
+        assert await s.seen_count("6902546888") == 1
+        # 新写入照常
+        await s.mark_seen(["new1"], {"new1": 2.0}, uid="6902546888")
+        assert await s.seen_count("6902546888") == 2
+    finally:
+        s.close()
+
+
+# ---------------- 免打扰顺延（v0.4.1）----------------
+
+
+async def test_reschedule_marks_deferred_in_snapshot(store):
+    """顺延标记要落进快照：下一轮从库里重读任务时才知道它被顺延过。"""
+    await store.add_task("p1", 1000.0, 0, {"weibo": "x", "author": "麦报"})
+    task = (await store.list_pending())[0]
+    await store.reschedule(task.id, 2000.0, mark_deferred=True)
+
+    reloaded = (await store.list_pending())[0]
+    assert reloaded.trigger_at == 2000.0
+    assert reloaded.status == STATUS_PENDING
+    assert reloaded.snapshot.get("deferred") is True
+    assert reloaded.snapshot.get("weibo") == "x", "原有快照字段不能被覆盖"
+
+
+async def test_reschedule_without_mark_keeps_snapshot(store):
+    await store.add_task("p1", 1000.0, 0, {"weibo": "x"})
+    task = (await store.list_pending())[0]
+    await store.reschedule(task.id, 2000.0)
+    reloaded = (await store.list_pending())[0]
+    assert "deferred" not in reloaded.snapshot
+
+
 # ---------------- @全体成员每日计数 ----------------
 
 

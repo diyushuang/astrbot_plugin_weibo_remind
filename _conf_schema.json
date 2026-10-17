@@ -1,9 +1,9 @@
 {
-  "uid": {
-    "description": "【必填】监控的微博账号 UID（个人主页 weibo.com/u/ 后面的数字）",
-    "type": "string",
-    "default": "6902546888",
-    "hint": "默认监控 UID 6902546888；修改后需重载插件生效"
+  "uids": {
+    "description": "【必填】监控的微博账号 UID 列表（个人主页 weibo.com/u/ 后面的数字）",
+    "type": "list",
+    "default": ["6902546888"],
+    "hint": "可填多个 UID 同时监控，每个账号独立判定新微博；旧版单账号字段 uid 仍会被读取并合并。修改后需重载插件生效"
   },
   "poll_interval": {
     "description": "【选填】轮询间隔（秒），最小 30",
@@ -105,6 +105,24 @@
     "type": "int",
     "default": 10,
     "hint": "超过该时长的过期任务标记为 missed 不再推送；0 表示重启后一律不补发"
+  },
+  "quiet_hours": {
+    "description": "【选填】免打扰时段，格式 HH:MM-HH:MM（支持跨午夜），留空表示不启用",
+    "type": "string",
+    "default": "",
+    "hint": "例：23:00-08:00。时段内到点的提醒会顺延到时段结束并标注「顺延提醒」（不顺延、也不静默丢弃：深夜不炸群，信息也不丢）；解析失败推原文这类非定时消息在时段内直接跳过"
+  },
+  "push_jitter_seconds": {
+    "description": "【选填】到点推送的随机延迟上限（秒），0 表示不延迟",
+    "type": "int",
+    "default": 0,
+    "hint": "多条提醒同时到点时，随机错开 0~N 秒再发，降低被平台判定刷屏/风控的概率。建议容易被风控的部署设为 5~30"
+  },
+  "push_interval_seconds": {
+    "description": "【选填】同一批到期任务之间的发送间隔（秒），0 表示不间隔",
+    "type": "int",
+    "default": 0,
+    "hint": "一轮扫描取到多条到期任务时，逐条发送并间隔 N 秒，避免消息洪峰。建议 2~5"
   },
   "at_all": {
     "description": "【选填】提醒推送时 @全体成员（仅群聊生效）",
