@@ -1,6 +1,6 @@
 # 微博定时提醒 · AstrBot 插件
 
-[![version](https://img.shields.io/badge/version-v0.4.1-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-v0.5.1-blue)](CHANGELOG.md)
 [![许可证](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.24%2C%3C5-orange)](https://github.com/AstrBotDevs/AstrBot)
 [![协议端](https://img.shields.io/badge/%E5%8D%8F%E8%AE%AE%E7%AB%AF-aiocqhttp%20%2F%20NapCat-brightgreen)](#安装)
@@ -23,6 +23,10 @@
   再决定处理方式。声明与建议博一律静默——实测 98 条真实博文里有 20 条是这类，
   它们含「月」「行程」等字样，按「有没有时间信号」判会被当成解析失败推给群友，纯噪音
 - **覆盖自检**：每条博文的处理结果留档统计，`微博提醒 覆盖` 随时看覆盖率与待补样本
+- **用户词表**：`include_keywords` / `exclude_keywords` 按关注的词收窄或屏蔽博文
+- **LLM 兜底**（可选）：规则解析不出时用 AstrBot 的 LLM 再抽一次，输出过四道校验才建提醒
+- **周期续期**：「每周五」「每天」类提醒发送后自动续建下一期（可关）
+- **Cookie 失效告警**：自备 Cookie 连续失效会在群里提醒更换，不再静默漏抓
 - **多档提醒**：默认提前 60 分钟、提前 10 分钟、到点各推一次，档位可配
 - **免登录抓取**：走 m.weibo.cn 的公开游客接口，不需要你的微博账号 Cookie
 - **重启不丢任务**：任务存 SQLite，重启后宽限窗内错过的提醒会带「补发」标记补推
@@ -96,6 +100,13 @@
 | `at_all_advance_minutes` | list | `[0]` | 只对这些提前档位 @全体（0=到点）；空列表=不限档位 |
 | `at_all_keywords` | list | `[]` | 仅当正文/命中原文含任一关键词才 @全体（空=不限） |
 | `at_all_daily_limit` | int | `5` | 每天 @全体 次数上限，0=不限；超限自动降级为普通提醒 |
+| `include_keywords` | list | `[]` | 只处理含任一关键词的博文（空=不限制） |
+| `exclude_keywords` | list | `[]` | 命中任一即静默（优先于 include） |
+| `llm_fallback` | bool | `false` | 规则失败时用 LLM 兜底抽时间（仅排期类博文） |
+| `llm_provider_id` | string | 空 | LLM 兜底使用的 provider ID，空=默认 provider |
+| `llm_timeout_seconds` | int | `25` | 单次 LLM 调用超时 |
+| `recurrence_renew` | bool | `true` | 「每周/每天」类提醒自动续期 |
+| `cookie_fail_alert_after` | int | `3` | Cookie 连续失效几轮后群告警（0=不告警） |
 | `text_max_length` | int | `500` | 正文摘要截断长度 |
 | `debug_parse` | bool | `false` | 把每条微博的解析候选明细写进日志 |
 
@@ -230,7 +241,7 @@ QQ 对 @全体 有频率限制、机器人在群里不是管理员时协议端�
 
 ## 局限与已知约束
 
-- **周期表达只提醒最近一次**：`每周五晚8点` 只会为下一个周五建一次任务，不会自动续期。
+- **周期续期只覆盖「每周 X」与「每天」**：`每月 X 日` 不续期（月份天数不一致，边界容易算错），`每周五晚8点` 这类会按 7 天自动续建下一期，可在配置里关掉。
 - **只能看到移动端公开可见的微博**：m.weibo.cn 游客接口看不到仅粉丝可见/已删除的内容。
 - **免登录只能取到最近 98 条**：更早的历史（该账号约 190 条）需要登录态，可填 `custom_cookie`。
 - **纯数字有歧义就不猜**：`1030` 既可能是 10:30 也可能是 10月30日，没有上下文时宁可不建任务。
@@ -249,7 +260,7 @@ QQ 对 @全体 有频率限制、机器人在群里不是管理员时协议端�
 
 ```bash
 pip install -r requirements.txt pytest pytest-asyncio ruff
-python -m pytest          # 253 项测试（含 43 项真实语料回归 + 包路径加载回归）
+python -m pytest          # 317 项测试（含 43 项真实语料回归 + 包路径加载回归）
 ruff check . && ruff format --check .
 ```
 
@@ -272,6 +283,8 @@ astrbot_plugin_weibo_remind/       ← 仓库根即插件目录（AstrBot 按目
 ├── post_coverage.py               博文形态分类 + 覆盖自检统计
 ├── store.py                       SQLite：已见微博 / 提醒任务 / @全体 计数
 ├── quiet_hours.py                 免打扰时段解析（顺延判定）
+├── llm_parser.py                  LLM 兜底抽取 + 四道防幻觉校验
+├── recurrence.py                  周期表达识别与续期计算
 ├── scheduler.py                   到点扫描与重启恢复
 ├── pusher.py                      推送渲染与发送（@全体 四道闸门 + 失败降级）
 ├── metadata.yaml                  插件元信息（版本号之一）
@@ -282,7 +295,7 @@ astrbot_plugin_weibo_remind/       ← 仓库根即插件目录（AstrBot 按目
 ├── ruff.toml / pytest.ini         代码风格与用例配置
 ├── .github/                       Issue 模板与 CI（ruff + pytest）
 ├── docs/                          安装配置、使用说明、覆盖分析、规范说明、发布前检查清单
-├── tests/                         253 项用例；tests/corpus/ 为真实博文夹具
+├── tests/                         317 项用例；tests/corpus/ 为真实博文夹具
 ├── CONTRIBUTING.md                贡献指南（目录/代码/测试/提交/发版流程）
 ├── SECURITY.md                    安全策略与威胁模型
 ├── CHANGELOG.md / LICENSE / README.md
@@ -301,7 +314,9 @@ astrbot_plugin_weibo_remind/       ← 仓库根即插件目录（AstrBot 按目
 - **解析不出** → 多半是新写法没覆盖，把原文提到 Issue 即可加进回归夹具；
 - **解析对了但没建任务** → 看日志结论：时间已过去、档位都已过、或纯数字有歧义（刻意不建）。
 - 也可能是**形态判定**：建议博 / 打假声明这类与提醒无关的博文会被静默，
-  它们含「月」「行程」字样但确实不是时间安排。
+  它们含「月」「行程」字样但确实不是时间安排；
+- 还可能是**词表过滤**：检查 `include_keywords` 是否要求了没出现的词、
+  或 `exclude_keywords` 是否命中了这条博文。
 
 **Q：为什么有的微博提醒了，有的没提醒？**
 看 [博文覆盖机制](#博文覆盖机制)——只有「排期公告类」才会建提醒，其余形态静默。
@@ -371,6 +386,6 @@ SSRF 主机白名单、风控冷却梯度）借鉴同作者的
 **本项目完全由 AI 生成**，包括代码、测试与文档。AI 生成不改变授权条件（见上），但意味着：
 
 - 代码的每一处结论都应以仓库内的**测试与实测记录**为准，而不是以"看起来合理"为准——
-  这也是本仓库为何带 253 项用例、真实博文夹具与故障注入验证；
+  这也是本仓库为何带 317 项用例、真实博文夹具与故障注入验证；
 - 使用者应自行评估、测试并承担使用风险；欢迎针对具体代码路径提出质疑，
   这类反馈最有价值（见 [CONTRIBUTING.md](CONTRIBUTING.md) 第 5 节的证据要求）。

@@ -15,12 +15,18 @@ from datetime import datetime
 from typing import Any
 
 try:
-    from .constants import SCHEDULER_SCAN_INTERVAL, TZ_CN
+    from .constants import SCHEDULER_SCAN_INTERVAL, TZ_CN, parse_advance_minutes
     from .quiet_hours import QuietHours, parse_quiet_hours
+    from .recurrence import Recurrence
     from .store import STATUS_FAILED, STATUS_MISSED, STATUS_PENDING, STATUS_SENDING, STATUS_SENT
 except ImportError:  # 独立脚本 / 测试环境
-    from constants import SCHEDULER_SCAN_INTERVAL, TZ_CN  # type: ignore
+    from constants import (  # type: ignore
+        SCHEDULER_SCAN_INTERVAL,
+        TZ_CN,
+        parse_advance_minutes,
+    )
     from quiet_hours import QuietHours, parse_quiet_hours  # type: ignore
+    from recurrence import Recurrence  # type: ignore
     from store import (  # type: ignore
         STATUS_FAILED,
         STATUS_MISSED,
@@ -78,6 +84,46 @@ class RemindScheduler:
     def interval_seconds(self) -> int:
         """同一批到期任务之间的发送间隔（秒）。"""
         return self._int_cfg("push_interval_seconds", 0)
+
+    # ---------------- 周期续期 ----------------
+
+    def recurrence_enabled(self) -> bool:
+        return bool(self.config.get("recurrence_renew", True))
+
+    async def renew_recurring(self, task: Any) -> int:
+        """「每周五 / 每天」类任务发送成功后，续建下一期，返回新建任务数。
+
+        只在到点档（advance=0）上续：主流程只给这一档挂了 recurrence，
+        其它档续期会重复建任务。UNIQUE(post_id, trigger_at, advance) 兜底去重。
+        """
+        snapshot = getattr(task, "snapshot", None) or {}
+        rec = Recurrence.from_dict(snapshot.get("recurrence"))
+        if rec is None or not self.recurrence_enabled():
+            return 0
+        if getattr(task, "advance_minutes", None) != 0:
+            return 0
+        next_event = rec.next_event_ts(task.event_ts)
+        now = time.time()
+        max_future_days = self._int_cfg("max_future_days", 60)
+        if max_future_days > 0 and next_event > now + max_future_days * 86400:
+            return 0
+        advances = parse_advance_minutes(self.config.get("remind_advance_minutes"))
+        new_snapshot = {**snapshot, "event_ts": next_event}
+        new_snapshot.pop("deferred", None)  # 新一期不该继承上一期的顺延标记
+        created = 0
+        for advance in advances:
+            trigger_at = next_event - advance * 60
+            if trigger_at <= now:
+                continue
+            if await self.store.add_task(task.post_id, trigger_at, advance, new_snapshot):
+                created += 1
+        if created:
+            when = datetime.fromtimestamp(next_event, tz=TZ_CN).strftime("%m-%d %H:%M")
+            self.log.info(
+                f"周期提醒已续期（{rec.kind}）：下一期 {when}，新建 {created} 条任务"
+                f"（{task.author} {task.source_text}）"
+            )
+        return created
 
     # ---------------- 重启恢复 ----------------
 
@@ -166,6 +212,13 @@ class RemindScheduler:
                     f"提醒已推送（{'补发' if is_makeup else '准点'}）"
                     f"：{task.author} {task.source_text} 提前 {task.advance_minutes} 分钟"
                 )
+                # 周期表达（每周五 / 每天）在发送成功后自动续建下一期
+                try:
+                    await self.renew_recurring(task)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self.log.warning(f"周期续期失败（不影响本次推送）: {e!r}")
         return results
 
     async def run(self) -> None:

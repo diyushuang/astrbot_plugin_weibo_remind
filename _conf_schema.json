@@ -40,10 +40,28 @@
     "default": [60, 10, 0],
     "hint": "每个识别出的时间点按每个档位各推送一次；例如 [60,10,0] 表示提前 1 小时、提前 10 分钟、到点各推一次。抓到微博时已经过去的档位自动跳过"
   },
+  "include_keywords": {
+    "description": "【选填】只处理包含这些关键词的微博（留空 = 不限制）",
+    "type": "list",
+    "default": [],
+    "hint": "与博文形态分类叠加生效：填了就只对命中的博文建提醒/推原文，例如只关注「直播 首播」。命中任一即可"
+  },
+  "exclude_keywords": {
+    "description": "【选填】跳过包含这些关键词的微博",
+    "type": "list",
+    "default": [],
+    "hint": "优先级高于 include：命中任一即整条静默（不建提醒、不推原文），例如屏蔽「抽奖 转发」"
+  },
   "max_future_days": {
     "description": "【选填】解析出的时间超过多少天则不创建任务",
     "type": "int",
     "default": 60
+  },
+  "recurrence_renew": {
+    "description": "【选填】「每周X」「每天」类提醒在发送成功后自动续建下一期",
+    "type": "bool",
+    "default": true,
+    "hint": "只支持每周与每天两类（每月不做：月份天数不一致，边界容易算错）。续期锚点是「到点」档，且实际触发时间超出 max_future_days 时不再续。关掉则恢复「周期表达只提醒最近一次」的旧行为"
   },
   "max_tasks_per_post": {
     "description": "【选填】单条微博最多创建的时间点任务数",
@@ -81,6 +99,12 @@
     "default": "",
     "secret": true,
     "hint": "留空时插件自动向微博游客系统换取匿名身份（无需登录）；填写后直接使用此 Cookie（格式 k1=v1; k2=v2），失效需自行更换。修改后需重载插件生效"
+  },
+  "cookie_fail_alert_after": {
+    "description": "【选填】自定义 Cookie 连续失效多少轮后向群里告警，0 表示不告警",
+    "type": "int",
+    "default": 3,
+    "hint": "只对自备 custom_cookie 的部署生效：连续失败达到该次数会在推送目标里提醒更换（每天最多一次）。避免 Cookie 过期后静默漏抓、群友却以为是博主没发微博"
   },
   "proxy": {
     "description": "【选填】HTTP(S) 代理地址，如 http://127.0.0.1:7890",
@@ -152,6 +176,24 @@
     "description": "【选填】推送/快照正文的摘要最大长度（字符数，超出截断加省略号）",
     "type": "int",
     "default": 500
+  },
+  "llm_fallback": {
+    "description": "【选填】规则解析失败时用 LLM 兜底抽取时间（排期类博文才调用）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后会消耗 LLM 调用额度：仅当三层规则都识别不出时间、且博文被判定为排期公告类才调用一次。LLM 输出必须通过四道校验（可解析/年份合理/在时间窗口内/引用原文真实存在）才会建提醒，编造的时间会被丢弃，失败则维持原有「推原文请群友确认」行为"
+  },
+  "llm_provider_id": {
+    "description": "【选填】LLM 兜底使用的 provider ID，留空表示用 AstrBot 当前默认 provider",
+    "type": "string",
+    "default": "",
+    "hint": "在 AstrBot 的「服务提供商」页面可以看到各 provider 的 ID；建议用一个便宜、响应快的模型专门做时间抽取"
+  },
+  "llm_timeout_seconds": {
+    "description": "【选填】单次 LLM 兜底调用超时（秒）",
+    "type": "int",
+    "default": 25,
+    "hint": "超时会放弃该条微博的 LLM 兜底并记日志；连续 3 次失败后本次运行不再调用，避免拖慢抓取循环"
   },
   "debug_parse": {
     "description": "【选填】调试：记录每条微博的时间解析候选明细到日志",

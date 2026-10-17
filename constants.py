@@ -13,7 +13,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 PLUGIN_NAME = "astrbot_plugin_weibo_remind"
-PLUGIN_VERSION = "v0.4.1"
+PLUGIN_VERSION = "v0.5.1"
 
 # ---------------- 微博接口 ----------------
 WEIBO_HOME_URL = "https://m.weibo.cn/"
@@ -97,6 +97,27 @@ ORDINAL_NOISE_RE: Pattern[str] = re.compile(
 )
 
 DEFAULT_REMIND_TEMPLATE = "⏰ 微博提醒\n【{name}】{source}\n⏱ 事件时间：{event_time}\n⌛ 提前 {advance}\n📝 {weibo}\n🔗 {link}"
+DEFAULT_ADVANCE_MINUTES = (60, 10, 0)
+
+
+def parse_advance_minutes(raw: object) -> list[int]:
+    """解析提前档位（分钟，降序）；非法输入回退默认 [60, 10, 0]。
+
+    主流程（建任务）与调度器（周期续期）共用同一口径。
+    """
+    if not isinstance(raw, (list, tuple)):
+        return list(DEFAULT_ADVANCE_MINUTES)
+    out: list[int] = []
+    for item in raw:
+        try:
+            value = max(0, int(item))
+        except (TypeError, ValueError):
+            continue
+        if value not in out:
+            out.append(value)
+    return sorted(out, reverse=True) or [0]
+
+
 DEFAULT_PARSE_FAIL_TEMPLATE = (
     "📢 {name} 发了新微博，提到时间安排但未能自动识别，请自行注意确认\n📝 {weibo}\n🔗 {link}"
 )

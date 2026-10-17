@@ -260,3 +260,80 @@ async def test_deferred_task_is_not_marked_missed_on_restart(store, log):
     assert report["missed"] == 0
     assert await store.pending_count() == 1
     assert (await store.list_pending())[0].status == STATUS_PENDING
+
+
+# ---------------- 周期续期（v0.5.1）----------------
+
+
+def _rec_snapshot(now: float) -> dict:
+    return {
+        "weibo": "每周五晚8点直播",
+        "author": "麦报",
+        "source_text": "每周五 20:00",
+        "event_ts": now,
+        "recurrence": {"kind": "weekly", "hour": 20, "minute": 0, "weekday": 4},
+    }
+
+
+async def test_recurring_task_renews_next_period(store, log):
+    """到点档发送成功后，按周期续建下一期的全套档位。"""
+    now = time.time()
+    await store.add_task("p1", now - 1, 0, _rec_snapshot(now))
+    config = {"remind_advance_minutes": [60, 10, 0], "max_future_days": 60}
+    sched = RemindScheduler(store, FakePusher(), config, log)
+
+    results = await sched.scan_once(now_ts=now)
+    assert results[0][1] == STATUS_SENT
+
+    tasks = await store.list_pending()
+    assert len(tasks) == 3, "下一期应建出三档"
+    assert all(t.snapshot["event_ts"] == pytest.approx(now + 7 * 86400) for t in tasks)
+    assert [t.advance_minutes for t in tasks] == [60, 10, 0]
+
+
+async def test_only_zero_tier_renews(store, log):
+    """非到点档不续期，避免同一条微博被续多次。"""
+    now = time.time()
+    snapshot = {**_rec_snapshot(now + 3600), "event_ts": now + 3600}
+    await store.add_task("p1", now - 1, 60, snapshot)
+    sched = RemindScheduler(store, FakePusher(), {"remind_advance_minutes": [60, 10, 0]}, log)
+
+    await sched.scan_once(now_ts=now)
+    assert await store.pending_count() == 0
+
+
+async def test_renew_respects_switch_and_horizon(store, log):
+    now = time.time()
+    await store.add_task("p1", now - 1, 0, _rec_snapshot(now))
+
+    # 开关关闭 → 不续
+    sched = RemindScheduler(
+        store, FakePusher(), {"recurrence_renew": False, "remind_advance_minutes": [0]}, log
+    )
+    await sched.scan_once(now_ts=now)
+    assert await store.pending_count() == 0
+
+    # 超出 max_future_days → 不续
+    await store.add_task("p2", now - 1, 0, _rec_snapshot(now))
+    sched2 = RemindScheduler(
+        store,
+        FakePusher(),
+        {"max_future_days": 3, "remind_advance_minutes": [0]},
+        log,
+    )
+    await sched2.scan_once(now_ts=now)
+    assert await store.pending_count() == 0
+
+
+async def test_renew_is_idempotent(store, log):
+    """重复扫描不会把下一期建成多份（UNIQUE 兜底）。"""
+    now = time.time()
+    await store.add_task("p1", now - 1, 0, _rec_snapshot(now))
+    sched = RemindScheduler(store, FakePusher(), {"remind_advance_minutes": [0]}, log)
+    await sched.scan_once(now_ts=now)
+
+    # 手动再触发一次续期（模拟重扫/重启后的重复调用）
+    task = (await store.list_pending())[0]
+    task.snapshot = _rec_snapshot(now)
+    await sched.renew_recurring(task)
+    assert await store.pending_count() == 1

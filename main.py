@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import random
 import time
 from datetime import datetime
@@ -46,8 +47,10 @@ try:  # 插件在 AstrBot 内以 data.plugins.<name> 包形式加载
         SEEN_IDS_LIMIT,
         TZ_CN,
         USAGE,
+        parse_advance_minutes,
     )
     from .fetcher import WeiboFetcher, WeiboFetchError, WeiboPost
+    from .llm_parser import LLMFallback
     from .post_coverage import (
         KIND_LABELS,
         OUTCOME_AMBIGUOUS,
@@ -62,6 +65,7 @@ try:  # 插件在 AstrBot 内以 data.plugins.<name> 包形式加载
         has_pending_time,
     )
     from .pusher import Pusher
+    from .recurrence import detect as detect_recurrence
     from .scheduler import RemindScheduler
     from .store import SQLiteStore
     from .time_parser import WeiboTimeParser
@@ -75,12 +79,14 @@ except ImportError:  # 独立脚本 / 测试环境
         SEEN_IDS_LIMIT,
         TZ_CN,
         USAGE,
+        parse_advance_minutes,
     )
     from fetcher import (  # type: ignore
         WeiboFetcher,
         WeiboFetchError,
         WeiboPost,
     )
+    from llm_parser import LLMFallback  # type: ignore
     from post_coverage import (  # type: ignore
         KIND_LABELS,
         OUTCOME_AMBIGUOUS,
@@ -95,12 +101,12 @@ except ImportError:  # 独立脚本 / 测试环境
         has_pending_time,
     )
     from pusher import Pusher  # type: ignore
+    from recurrence import detect as detect_recurrence  # type: ignore
     from scheduler import RemindScheduler  # type: ignore
     from store import SQLiteStore  # type: ignore
     from time_parser import WeiboTimeParser  # type: ignore
 
 DB_FILENAME = "weibo_remind.db"
-DEFAULT_ADVANCE_MINUTES = (60, 10, 0)
 # 任务触发时间早于「现在 + 这个秒数」就视为该档已过，静默跳过
 TRIGGER_MIN_LEAD = 30
 
@@ -137,17 +143,28 @@ class WeiboRemindPlugin(Star):
         self.pusher: Pusher | None = None
         self.scheduler: RemindScheduler | None = None
         self.coverage: CoverageTracker | None = None
+        # LLM 兜底层：默认关闭，且调用方（provider）在 initialize 时解析，
+        # 找不到可用 provider 时整层静默降级，不影响规则解析
+        self.llm: LLMFallback | None = (
+            LLMFallback(self.config, self.logger, ask=self._ask_llm)
+            if LLMFallback.enabled(self.config)
+            else None
+        )
         self._data_dir: Path | None = None
         self._poll_task: asyncio.Task | None = None
         self._sched_task: asyncio.Task | None = None
         self._paused = False
         self._kick = asyncio.Event()
         self._fail_streak = 0
+        # 自定义 Cookie 连续失效计数与告警去重（每天最多一次群告警）
+        self._cookie_fail_streak = 0
+        self._cookie_alert_day = ""
         self._stats: dict[str, Any] = {
             "fetch_rounds": 0,
             "new_posts": 0,
             "tasks_created": 0,
             "parse_fail_pushed": 0,
+            "llm_parsed": 0,
             "last_fetch_ts": 0.0,
             "started_ts": time.time(),
         }
@@ -196,6 +213,15 @@ class WeiboRemindPlugin(Star):
             )
         if not self.parser.jionlp_ready:
             self.logger.warning("jionlp 未安装，中文自然语言时间解析不可用（pip install jionlp）")
+        if self.llm is not None:
+            provider = await self._llm_provider()
+            if provider is None:
+                self.llm.disabled_reason = "未找到可用的 LLM provider"
+                self.logger.warning(
+                    "llm_fallback 已开启但未找到可用的 LLM provider，本次运行将跳过 LLM 兜底"
+                )
+            else:
+                self.logger.info("LLM 兜底解析已启用（规则层解析失败时才会调用）")
 
     async def terminate(self) -> None:
         for task in (self._poll_task, self._sched_task):
@@ -249,24 +275,48 @@ class WeiboRemindPlugin(Star):
 
     def _advance_minutes(self) -> list[int]:
         """提前档位（分钟，降序）；非法输入回退默认 [60, 10, 0]。"""
-        raw = self.config.get("remind_advance_minutes")
-        if raw is None or not isinstance(raw, (list, tuple)):
-            return list(DEFAULT_ADVANCE_MINUTES)
-        out: list[int] = []
-        for item in raw:
-            try:
-                value = max(0, int(item))
-            except (TypeError, ValueError):
-                continue
-            if value not in out:
-                out.append(value)
-        return sorted(out, reverse=True) or [0]
+        return parse_advance_minutes(self.config.get("remind_advance_minutes"))
 
     def _save_config(self) -> None:
         """落盘配置；config 可能是纯 dict（测试注入），无 save_config 可调。"""
         saver = getattr(self.config, "save_config", None)
         if callable(saver):
             saver()
+
+    # ---------------- LLM 兜底 ----------------
+
+    async def _llm_provider(self) -> Any | None:
+        """取 LLM provider：优先配置指定的 id，否则用 AstrBot 当前默认 provider。
+
+        不同 AstrBot 版本的取法有差异：优先用异步版（存在则在用），
+        退回同步版；两者都没有就返回 None（LLM 层静默降级）。
+        """
+        ctx = self.context
+        pid = str(self.config.get("llm_provider_id") or "").strip()
+        try:
+            if pid:
+                getter = getattr(ctx, "get_provider_by_id", None)
+                return getter(pid) if callable(getter) else None
+            getter = getattr(ctx, "get_using_provider_async", None)
+            if callable(getter):
+                provider = getter()
+                if inspect.isawaitable(provider):
+                    provider = await provider
+                return provider
+            sync_getter = getattr(ctx, "get_using_provider", None)
+            if callable(sync_getter):
+                return sync_getter()
+        except Exception as e:
+            self.logger.info(f"获取 LLM provider 失败（LLM 兜底本次跳过）: {e!r}")
+        return None
+
+    async def _ask_llm(self, prompt: str, system: str) -> str:
+        """调用 LLM；出错直接抛出，由 LLMFallback 统一计数与降级。"""
+        provider = await self._llm_provider()
+        if provider is None:
+            raise RuntimeError("未找到可用的 LLM provider")
+        resp = await provider.text_chat(prompt=prompt, system_prompt=system)
+        return str(getattr(resp, "completion_text", "") or "")
 
     # ---------------- 轮询与解析 ----------------
 
@@ -331,6 +381,7 @@ class WeiboRemindPlugin(Star):
                 # 单账号失败不影响其它账号；若触发的是风控冷却，
                 # 后续账号会在冷却检查处快速失败，无害
                 self.logger.warning(f"抓取 uid={uid} 失败（本轮跳过该账号）: {e}")
+                await self._note_cookie_failure(e)
         if failed == len(uids) and first_error is not None:
             raise first_error
         self._stats["fetch_rounds"] += 1
@@ -344,6 +395,8 @@ class WeiboRemindPlugin(Star):
         baseline = await self.store.seen_count(uid) == 0
         known = set() if baseline else await self.store.known_ids(SEEN_IDS_LIMIT, uid=uid)
         posts = await self.fetcher.fetch_timeline(uid, known_ids=None if baseline else known)
+        # 抓取成功即说明凭据可用，清掉 Cookie 失效累计
+        self._cookie_fail_streak = 0
         if not posts:
             self.logger.info(f"uid={uid} 本轮未取到微博（可能被风控或账号无公开微博）")
             return 0
@@ -364,6 +417,47 @@ class WeiboRemindPlugin(Star):
         self._stats["tasks_created"] += created
         await self._flush_coverage()
         return created
+
+    def _word_list(self, key: str) -> list[str]:
+        raw = self.config.get(key)
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return [str(item).strip() for item in raw if str(item).strip()]
+
+    def _keyword_allowed(self, text: str) -> bool:
+        """用户词表过滤：命中屏蔽词 → 丢；有白名单且一条没命中 → 丢。
+
+        与「博文形态分类」是叠加关系：先分类（内置规则），再过词表（用户配置）。
+        作用是让部署方按自己的关注点收窄范围，例如只推含「直播」的博文，
+        或屏蔽含「抽奖」的博文。
+        """
+        excludes = self._word_list("exclude_keywords")
+        if any(word in text for word in excludes):
+            return False
+        includes = self._word_list("include_keywords")
+        return not includes or any(word in text for word in includes)
+
+    async def _note_cookie_failure(self, error: Exception) -> None:
+        """自定义 Cookie 连续失效达到阈值 → 往群里告警一次（每天最多一次）。
+
+        旧行为只有日志里一行错误，群友完全不知道「提醒为什么突然不来了」。
+        """
+        if "Cookie 已失效" not in str(error):
+            self._cookie_fail_streak = 0
+            return
+        self._cookie_fail_streak += 1
+        threshold = self._int_cfg("cookie_fail_alert_after", 3)
+        if threshold <= 0 or self._cookie_fail_streak < threshold:
+            return
+        today = datetime.now(tz=TZ_CN).strftime("%Y-%m-%d")
+        if self._cookie_alert_day == today or self.pusher is None:
+            return
+        self._cookie_alert_day = today
+        await self.pusher.broadcast(
+            "⚠️ 微博提醒：配置的自定义 Cookie 已失效，最近几轮都没有抓到新微博。\n"
+            "请到 AstrBot 管理面板的插件配置里更换 custom_cookie，或清空它改用免登录游客身份。"
+        )
+        self.logger.warning("自定义 Cookie 连续失效，已在群里发出告警（今日仅一次）")
 
     async def _flush_coverage(self) -> None:
         """把覆盖自检统计落盘（跨重启累计，供「微博提醒 覆盖」查看）。"""
@@ -413,6 +507,14 @@ class WeiboRemindPlugin(Star):
         limit = self._int_cfg("text_max_length", 500)
         weibo_text = body[:limit] if limit > 0 else body
 
+        # 用户词表过滤：命中屏蔽词或不满足白名单的博文整条跳过（不建任务、不推原文）
+        if not self._keyword_allowed(body):
+            self.logger.info(f"{post.id} 未通过关键词过滤，静默跳过")
+            self._record_outcome(
+                post, kind, OUTCOME_SILENT, 0, "关键词过滤（include/exclude 未通过）", weibo_text
+            )
+            return 0
+
         window_minutes = self._int_cfg("check_window_minutes", 720)
         if post.created_ts and window_minutes > 0 and now - post.created_ts > window_minutes * 60:
             self.logger.info(f"跳过 {post.id}：发布已超过 {window_minutes} 分钟（时效窗口）")
@@ -428,13 +530,26 @@ class WeiboRemindPlugin(Star):
         )
         result = self.parser.parse(body, base_dt, now)
 
-        if not result.candidates:
+        # 规则三层都失败时才请 LLM 兜底，且只对排期公告类博文调用——
+        # 日常/建议/打假博本来就不该建提醒，让 LLM 去「找时间」只会制造噪音
+        candidates = list(result.candidates)
+        used_llm = False
+        if not candidates and kind.schedule and self.llm is not None:
+            candidates = await self.llm.extract(body, base_dt, now)
+            used_llm = bool(candidates)
+            if used_llm:
+                self._stats["llm_parsed"] += 1
+                self.logger.info(
+                    f"{post.id} 规则层未识别出时间，LLM 兜底得到 {len(candidates)} 个候选"
+                )
+
+        if not candidates:
             return await self._handle_no_candidate(post, kind, result, weibo_text, now)
 
         advances = self._advance_minutes()
         cap = self._int_cfg("max_tasks_per_post", 3, minimum=1)
         created = 0
-        for cand in result.candidates[:cap]:
+        for cand in candidates[:cap]:
             snapshot = {
                 "author": post.author,
                 "weibo": weibo_text,
@@ -443,19 +558,27 @@ class WeiboRemindPlugin(Star):
                 "event_ts": cand.trigger_ts,
                 "weibo_created_at": post.created_at,
                 "post_kind": kind.kind,
+                "parsed_by": "llm" if used_llm else "rule",
             }
+            # 周期表达（每周五 / 每天）只挂在「到点」档上，由调度器在发送成功后
+            # 续建下一期；挂在每一档会导致同一条微博被续期多次
+            rec = detect_recurrence(body, datetime.fromtimestamp(cand.trigger_ts, tz=TZ_CN))
             for advance in advances:
                 trigger_at = cand.trigger_ts - advance * 60
                 if trigger_at <= now + TRIGGER_MIN_LEAD:
                     # 该档已过（例如抓到微博时已经离事件不足 60 分钟）
                     continue
-                if await self.store.add_task(post.id, trigger_at, advance, snapshot):
+                snap = dict(snapshot)
+                if rec is not None and advance == 0:
+                    snap["recurrence"] = rec.to_dict()
+                if await self.store.add_task(post.id, trigger_at, advance, snap):
                     created += 1
         if created:
-            preview = "、".join(f"{c.source_text}" for c in result.candidates[:cap])
-            self.logger.info(f"{post.id} 已创建 {created} 条提醒任务（时间点：{preview}）")
+            preview = "、".join(f"{c.source_text}" for c in candidates[:cap])
+            tag = "（LLM 兜底）" if used_llm else ""
+            self.logger.info(f"{post.id} 已创建 {created} 条提醒任务{tag}（时间点：{preview}）")
             self._record_outcome(
-                post, kind, OUTCOME_TASKED, created, f"时间点：{preview}", weibo_text
+                post, kind, OUTCOME_TASKED, created, f"时间点：{preview}{tag}", weibo_text
             )
         else:
             self.logger.info(f"{post.id} 的时间点均已过或已有任务，未新建")
@@ -614,7 +737,8 @@ class WeiboRemindPlugin(Star):
             f"｜轮询间隔 {self._poll_interval()} 秒",
             f"上次抓取：{last_fetch}｜累计轮次 {self._stats['fetch_rounds']}",
             f"新微博累计：{self._stats['new_posts']}｜建任务 {self._stats['tasks_created']}"
-            f"｜解析失败推送 {self._stats['parse_fail_pushed']}",
+            f"｜解析失败推送 {self._stats['parse_fail_pushed']}"
+            f"｜LLM 兜底 {self._stats['llm_parsed']}",
             f"待触发任务：{stats['by_status'].get('pending', 0) + stats['by_status'].get('sending', 0)}"
             f"｜下次触发 {next_trigger}",
             f"已见微博记录：{stats['seen_count']}",
@@ -623,7 +747,12 @@ class WeiboRemindPlugin(Star):
             f"免打扰时段：{self.pusher.quiet().spec if self.pusher.quiet() else '未启用'}"
             f"｜推送抖动 {self.scheduler.jitter_seconds() if self.scheduler else 0} 秒"
             f"｜批内间隔 {self.scheduler.interval_seconds() if self.scheduler else 0} 秒",
-            f"解析引擎：jionlp {'可用' if self.parser.jionlp_ready else '不可用（降级）'}",
+            f"词表过滤：include {len(self._word_list('include_keywords'))} 个"
+            f"｜exclude {len(self._word_list('exclude_keywords'))} 个"
+            f"｜周期续期 "
+            f"{'开' if self.scheduler and self.scheduler.recurrence_enabled() else '关'}",
+            f"解析引擎：jionlp {'可用' if self.parser.jionlp_ready else '不可用（降级）'}"
+            f"｜LLM 兜底 {self._llm_state()}",
             f"游客身份：{'有效' if self.fetcher and self.fetcher.visitor_alive else '待获取'}",
             f"风控冷却：{f'冷却中（剩余 {remaining} 秒）' if cooling else '正常'}",
         ]
@@ -742,6 +871,14 @@ class WeiboRemindPlugin(Star):
             self.logger.info(f"读取 @全体 计数失败（忽略）: {e!r}")
             return 0
 
+    def _llm_state(self) -> str:
+        """状态指令里的 LLM 兜底一句话描述。"""
+        if self.llm is None:
+            return "关"
+        if self.llm.disabled_reason:
+            return f"开（不可用：{self.llm.disabled_reason}）"
+        return "开"
+
     @weibo_remind.command("暂停")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_pause(self, event: AstrMessageEvent):
@@ -775,14 +912,28 @@ class WeiboRemindPlugin(Star):
             )
             return
         now = time.time()
-        result = self.parser.parse(text, datetime.now(tz=TZ_CN), now)
+        base_dt = datetime.now(tz=TZ_CN)
+        result = self.parser.parse(text, base_dt, now)
         lines = [f"解析「{text}」："]
         if result.candidates:
             for cand in result.candidates:
                 when = WeiboTimeParser.human_time(cand.trigger_ts)
                 lines.append(f"· {when}（{cand.engine}｜命中原文：{cand.source_text}）")
         else:
-            lines.append("· 未得到可用时间点")
+            lines.append("· 规则层未得到可用时间点")
+            if self.llm is not None:
+                llm_cands = await self.llm.extract(text, base_dt, now)
+                if llm_cands:
+                    lines.append("· LLM 兜底（已通过校验）：")
+                    for cand in llm_cands:
+                        lines.append(
+                            f"  {WeiboTimeParser.human_time(cand.trigger_ts)}"
+                            f"｜命中原文：{cand.source_text}"
+                        )
+                elif self.llm.disabled_reason:
+                    lines.append(f"  LLM 未启用：{self.llm.disabled_reason}")
+                else:
+                    lines.append("  LLM 也未抽出可用时间")
         lines.append(
             f"时间表达计数 {result.raw_hits}｜纯数字歧义 {result.ambiguous}"
             f"｜疑似含时间安排 {'是' if result.suspect else '否'}"

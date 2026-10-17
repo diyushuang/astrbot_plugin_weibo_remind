@@ -628,3 +628,237 @@ def test_logger_is_kept_when_star_provides_one(monkeypatch):
     monkeypatch.setattr(Star, "__init__", init_with_logger)
     inst = WeiboRemindPlugin(context=FakeContext(), config={})
     assert inst.logger is sentinel
+
+
+# ---------------- LLM 兜底解析（v0.5.0）----------------
+
+
+async def test_llm_fallback_builds_tasks_when_rules_fail(plugin, monkeypatch):
+    """规则三层都失败、LLM 给出通过校验的时间 → 照常建任务，快照标 parsed_by=llm。"""
+    import json
+
+    from llm_parser import LLMFallback
+    from time_parser import ParseResult
+
+    await plugin.initialize()
+    try:
+        event = (now_cn() + timedelta(days=5)).replace(hour=20, minute=0, second=0, microsecond=0)
+        text = f"📢发布节奏 / {event.month}月{event.day}日 晚间开播"
+        post = _post("p-llm", text, now_cn())
+        # 规则层假装完全没识别出时间（真实场景里是没覆盖的新写法）
+        monkeypatch.setattr(
+            plugin.parser, "parse", lambda body, base, now: ParseResult(raw_hits=0, suspect=True)
+        )
+
+        calls = {"n": 0}
+
+        async def fake_ask(prompt, system):
+            calls["n"] += 1
+            return json.dumps(
+                {
+                    "times": [
+                        {
+                            "when": event.strftime("%Y-%m-%d %H:%M"),
+                            "source": f"{event.month}月{event.day}日 晚间",
+                            "confidence": 0.9,
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+
+        plugin.llm = LLMFallback({"max_future_days": 60}, plugin.logger, ask=fake_ask)
+        created = await plugin._process_post(post)
+        assert calls["n"] == 1, "规则失败时应调用一次 LLM"
+        assert created == 3, "三个档位都应建任务"
+        tasks = await plugin.store.list_pending()
+        assert all(t.snapshot.get("parsed_by") == "llm" for t in tasks)
+        assert all(t.snapshot.get("source_text") for t in tasks)
+        assert plugin._stats["llm_parsed"] == 1
+        # 覆盖自检里算「建出提醒」，不算待补样本
+        stats = plugin.coverage.stats()
+        assert stats["schedule_tasked"] == 1
+        assert stats["uncovered_total"] == 0
+    finally:
+        await plugin.terminate()
+
+
+async def test_llm_hallucinated_time_is_rejected(plugin, monkeypatch):
+    """LLM 编造「正文里没有的时间」→ 四道闸门拦下，维持原有推原文行为。"""
+    import json
+
+    from llm_parser import LLMFallback
+    from time_parser import ParseResult
+
+    await plugin.initialize()
+    try:
+        post = _post("p-hallu", "📢发布节奏 / 具体时间后续公布 / 请留意", now_cn())
+        monkeypatch.setattr(
+            plugin.parser, "parse", lambda body, base, now: ParseResult(raw_hits=0, suspect=True)
+        )
+
+        async def fake_ask(prompt, system):
+            future = (now_cn() + timedelta(days=5)).strftime("%Y-%m-%d") + " 20:00"
+            return json.dumps(
+                {"times": [{"when": future, "source": "10月24日晚8点", "confidence": 0.99}]},
+                ensure_ascii=False,
+            )
+
+        plugin.llm = LLMFallback({"max_future_days": 60}, plugin.logger, ask=fake_ask)
+        assert await plugin._process_post(post) == 0
+        assert await plugin.store.pending_count() == 0
+        assert len(plugin.context.sent) == 1, "被拦下后应回到「推原文请群友确认」"
+        assert "未能自动识别" in plugin.context.sent[0][1]
+    finally:
+        await plugin.terminate()
+
+
+async def test_llm_not_called_when_rules_succeed(plugin, monkeypatch):
+    """规则层已经识别出时间时不该再花 token 调 LLM。"""
+    from llm_parser import LLMFallback
+
+    await plugin.initialize()
+    try:
+        post = _post("p-rule-ok", f"📢发布节奏 / ⏰{_future_text()} / 20:00 直播", now_cn())
+        calls = {"n": 0}
+
+        async def fake_ask(prompt, system):
+            calls["n"] += 1
+            return "{}"
+
+        plugin.llm = LLMFallback({}, plugin.logger, ask=fake_ask)
+        assert await plugin._process_post(post) > 0
+        assert calls["n"] == 0
+    finally:
+        await plugin.terminate()
+
+
+async def test_llm_not_called_for_non_schedule_posts(plugin, monkeypatch):
+    """日常/建议/打假类博文不调 LLM——本来就不该建提醒，找时间只会制造噪音。"""
+    from llm_parser import LLMFallback
+
+    await plugin.initialize()
+    try:
+        post = _post("p-daily-llm", "今天天气不错，大家早安", now_cn())
+        calls = {"n": 0}
+
+        async def fake_ask(prompt, system):
+            calls["n"] += 1
+            future = (now_cn() + timedelta(days=3)).strftime("%Y-%m-%d") + " 20:00"
+            return '{"times":[{"when":"' + future + '","source":"今天天气不错","confidence":0.9}]}'
+
+        plugin.llm = LLMFallback({}, plugin.logger, ask=fake_ask)
+        assert await plugin._process_post(post) == 0
+        assert calls["n"] == 0
+        assert plugin.context.sent == []
+    finally:
+        await plugin.terminate()
+
+
+# ---------------- 词表过滤 / Cookie 告警 / 周期标记（v0.5.1）----------------
+
+
+async def test_exclude_keyword_skips_post(plugin):
+    """命中屏蔽词 → 整条静默（不建提醒、也不推原文）。"""
+    plugin.config["exclude_keywords"] = ["抽奖"]
+    post = _post("p-ex", f"📢发布节奏 / ⏰{_future_text()} / 20:00 直播 / 转发抽奖", now_cn())
+    await plugin.initialize()
+    try:
+        assert await plugin._process_post(post) == 0
+        assert await plugin.store.pending_count() == 0
+        assert plugin.context.sent == []
+        assert plugin.coverage.stats()["uncovered_total"] == 0, "词表过滤不算覆盖缺口"
+    finally:
+        await plugin.terminate()
+
+
+async def test_include_keyword_requires_hit(plugin):
+    plugin.config["include_keywords"] = ["直播"]
+    await plugin.initialize()
+    try:
+        miss = _post("p-miss", f"📢发布节奏 / ⏰{_future_text()} / 20:00 物料", now_cn())
+        assert await plugin._process_post(miss) == 0
+        assert await plugin.store.pending_count() == 0
+
+        hit = _post("p-hit", f"📢发布节奏 / ⏰{_future_text()} / 20:00 直播", now_cn())
+        assert await plugin._process_post(hit) > 0
+    finally:
+        await plugin.terminate()
+
+
+async def test_keyword_filters_apply_to_parse_fail_push(plugin):
+    """排期类解析失败要推原文，但被屏蔽词拦下就不推。"""
+    plugin.config["exclude_keywords"] = ["抽奖"]
+    post = _post("p-fail-ex", "📢发布节奏 / 转发抽奖 / 具体时间后续公布", now_cn())
+    await plugin.initialize()
+    try:
+        assert await plugin._process_post(post) == 0
+        assert plugin.context.sent == []
+    finally:
+        await plugin.terminate()
+
+
+async def test_cookie_failure_alerts_once_per_day(plugin):
+    """自定义 Cookie 连续失效 3 轮 → 群里告警一次，当天不重复。"""
+    await plugin.initialize()
+    try:
+        err = WeiboFetchError("自定义 Cookie 已失效（接口要求登录）")
+        for _ in range(2):
+            await plugin._note_cookie_failure(err)
+        assert plugin.context.sent == [], "未达阈值不告警"
+
+        await plugin._note_cookie_failure(err)
+        assert len(plugin.context.sent) == 1
+        assert "Cookie 已失效" in plugin.context.sent[0][1]
+
+        await plugin._note_cookie_failure(err)
+        assert len(plugin.context.sent) == 1, "同一天只告警一次"
+    finally:
+        await plugin.terminate()
+
+
+async def test_cookie_alert_disabled_by_zero(plugin):
+    plugin.config["cookie_fail_alert_after"] = 0
+    await plugin.initialize()
+    try:
+        err = WeiboFetchError("自定义 Cookie 已失效（接口要求登录）")
+        for _ in range(10):
+            await plugin._note_cookie_failure(err)
+        assert plugin.context.sent == []
+    finally:
+        await plugin.terminate()
+
+
+async def test_non_cookie_errors_reset_streak(plugin):
+    """普通网络错误不算 Cookie 失效，遇到就清零（避免误报）。"""
+    await plugin.initialize()
+    try:
+        await plugin._note_cookie_failure(WeiboFetchError("请求失败: timeout"))
+        assert plugin._cookie_fail_streak == 0
+    finally:
+        await plugin.terminate()
+
+
+async def test_weekly_post_marks_recurrence_on_zero_tier(plugin, monkeypatch):
+    """「每周五」类博文：只有到点档带周期标记，供调度器续期。"""
+    from time_parser import ParseResult, TimeCandidate
+
+    await plugin.initialize()
+    try:
+        event = (now_cn() + timedelta(days=6)).replace(hour=20, minute=0, second=0, microsecond=0)
+        post = _post("p-weekly", "每周五晚8点直播，欢迎来看", now_cn())
+        monkeypatch.setattr(
+            plugin.parser,
+            "parse",
+            lambda body, base, now: ParseResult(
+                candidates=[TimeCandidate(event.timestamp(), "每周五 20:00", "jionlp")]
+            ),
+        )
+        assert await plugin._process_post(post) == 3
+        tasks = await plugin.store.list_pending()
+        zero = [t for t in tasks if t.advance_minutes == 0]
+        others = [t for t in tasks if t.advance_minutes != 0]
+        assert len(zero) == 1 and zero[0].snapshot.get("recurrence", {}).get("kind") == "weekly"
+        assert all("recurrence" not in t.snapshot for t in others)
+    finally:
+        await plugin.terminate()
