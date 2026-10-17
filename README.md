@@ -260,7 +260,7 @@ QQ 对 @全体 有频率限制、机器人在群里不是管理员时协议端�
 
 ```bash
 pip install -r requirements.txt pytest pytest-asyncio ruff
-python -m pytest          # 317 项测试（含 43 项真实语料回归 + 包路径加载回归）
+python -m pytest          # 325 项测试（含 43 项真实语料回归 + 包路径加载回归）
 ruff check . && ruff format --check .
 ```
 
@@ -295,7 +295,7 @@ astrbot_plugin_weibo_remind/       ← 仓库根即插件目录（AstrBot 按目
 ├── ruff.toml / pytest.ini         代码风格与用例配置
 ├── .github/                       Issue 模板与 CI（ruff + pytest）
 ├── docs/                          安装配置、使用说明、覆盖分析、规范说明、发布前检查清单
-├── tests/                         317 项用例；tests/corpus/ 为真实博文夹具
+├── tests/                         325 项用例；tests/corpus/ 为真实博文夹具
 ├── CONTRIBUTING.md                贡献指南（目录/代码/测试/提交/发版流程）
 ├── SECURITY.md                    安全策略与威胁模型
 ├── CHANGELOG.md / LICENSE / README.md
@@ -367,6 +367,13 @@ SSRF 主机白名单、风控冷却梯度）借鉴同作者的
 [astrbot_plugin_weibo_forward_to_qqgroup](https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup)
 （MIT）并按其实测口径精简移植；中文时间语义解析使用 [JioNLP](https://github.com/dongrixinyu/JioNLP)（Apache-2.0）。
 
+v0.4.x ~ v0.5.x 的功能设计参考了社区同类项目的**公开文档**（未复制其代码）：
+多账号与发送队列见 [nonebot-bison](https://github.com/MountainDash/nonebot-bison)，
+免打扰时段与 Cookie 生命周期见 [WebMoniter](https://github.com/666fy666/WebMoniter)、
+[aio-dynamic-push](https://github.com/Foursen/aio-dynamic-push)，
+随机延迟与 LLM 日程识别见 [astrbot_plugin_reminder](https://github.com/Foolllll-J/astrbot_plugin_reminder)，
+关键词过滤见 koishi 微博监控系与 [TrendRadar](https://github.com/sansan0/TrendRadar)。
+
 ## 许可
 
 本项目采用 [MIT License](LICENSE) 开源。
@@ -386,6 +393,6 @@ SSRF 主机白名单、风控冷却梯度）借鉴同作者的
 **本项目完全由 AI 生成**，包括代码、测试与文档。AI 生成不改变授权条件（见上），但意味着：
 
 - 代码的每一处结论都应以仓库内的**测试与实测记录**为准，而不是以"看起来合理"为准——
-  这也是本仓库为何带 317 项用例、真实博文夹具与故障注入验证；
+  这也是本仓库为何带 325 项用例、真实博文夹具与故障注入验证；
 - 使用者应自行评估、测试并承担使用风险；欢迎针对具体代码路径提出质疑，
   这类反馈最有价值（见 [CONTRIBUTING.md](CONTRIBUTING.md) 第 5 节的证据要求）。

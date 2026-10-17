@@ -40,6 +40,10 @@ _WEEKDAY_MAP = {
 }
 _WEEKLY_RE = re.compile(r"每(?:周|星期|礼拜)\s*([一二三四五六日天1-7])")
 _DAILY_RE = re.compile(r"每(?:天|日)")
+# 「每天」的误判面比「每周五」大得多（"每日一图""每天不定时掉落"都会命中），
+# 所以额外要求正文里出现明确的时刻标记才认（20:00 / 8点）。
+# 代价是「每天八点」这类纯中文数字不续期——宁可漏续，也不每天误提醒。
+_TIME_HINT_RE = re.compile(r"\d{1,2}\s*[:：]\s*\d{2}|\d{1,2}\s*点")
 
 
 @dataclass(frozen=True)
@@ -101,6 +105,6 @@ def detect(body: str, event_dt: datetime) -> Recurrence | None:
         return Recurrence(
             kind="weekly", hour=event_dt.hour, minute=event_dt.minute, weekday=weekday
         )
-    if _DAILY_RE.search(text):
+    if _DAILY_RE.search(text) and _TIME_HINT_RE.search(text):
         return Recurrence(kind="daily", hour=event_dt.hour, minute=event_dt.minute)
     return None

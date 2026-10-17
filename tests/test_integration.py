@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 import pytest
 from conftest import CN, now_cn
 
-from fetcher import WeiboFetchError, WeiboPost
+from fetcher import WeiboCookieExpiredError, WeiboFetchError, WeiboPost
 from main import WeiboRemindPlugin
 from scheduler import RemindScheduler
 from store import STATUS_SENT
@@ -802,7 +802,7 @@ async def test_cookie_failure_alerts_once_per_day(plugin):
     """自定义 Cookie 连续失效 3 轮 → 群里告警一次，当天不重复。"""
     await plugin.initialize()
     try:
-        err = WeiboFetchError("自定义 Cookie 已失效（接口要求登录）")
+        err = WeiboCookieExpiredError("ok=-100")
         for _ in range(2):
             await plugin._note_cookie_failure(err)
         assert plugin.context.sent == [], "未达阈值不告警"
@@ -821,7 +821,7 @@ async def test_cookie_alert_disabled_by_zero(plugin):
     plugin.config["cookie_fail_alert_after"] = 0
     await plugin.initialize()
     try:
-        err = WeiboFetchError("自定义 Cookie 已失效（接口要求登录）")
+        err = WeiboCookieExpiredError("ok=-100")
         for _ in range(10):
             await plugin._note_cookie_failure(err)
         assert plugin.context.sent == []
@@ -860,5 +860,27 @@ async def test_weekly_post_marks_recurrence_on_zero_tier(plugin, monkeypatch):
         others = [t for t in tasks if t.advance_minutes != 0]
         assert len(zero) == 1 and zero[0].snapshot.get("recurrence", {}).get("kind") == "weekly"
         assert all("recurrence" not in t.snapshot for t in others)
+    finally:
+        await plugin.terminate()
+
+
+async def test_cookie_failure_detected_by_type_not_message(plugin):
+    """判定走异常类型：文案改了也不会漏掉告警（旧的字符串匹配是脆弱点）。"""
+    await plugin.initialize()
+    try:
+        for _ in range(3):
+            await plugin._note_cookie_failure(WeiboCookieExpiredError("接口返回 ok=-100"))
+        assert plugin._cookie_fail_streak == 3
+        assert len(plugin.context.sent) == 1
+    finally:
+        await plugin.terminate()
+
+
+async def test_legacy_cookie_message_still_detected(plugin):
+    """兜底：其它路径抛出的普通错误只要带旧文案，仍按 Cookie 失效计数。"""
+    await plugin.initialize()
+    try:
+        await plugin._note_cookie_failure(WeiboFetchError("自定义 Cookie 已失效（接口要求登录）"))
+        assert plugin._cookie_fail_streak == 1
     finally:
         await plugin.terminate()

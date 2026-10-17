@@ -33,8 +33,11 @@ constants.py          跨模块共享的常量与正则（URL / 风控参数 / �
 fetcher.py            微博抓取：游客身份三步流、时间线、SSRF 校验、风控冷却
 time_parser.py        三层时间解析（结构化 / 纯数字 / jionlp）
 post_coverage.py      博文形态分类与覆盖自检
+llm_parser.py         LLM 兜底抽取 + 四道防幻觉校验（可选，默认关闭）
+recurrence.py         周期表达识别（每周X / 每天）与续期计算
+quiet_hours.py        免打扰时段解析与顺延判定
 store.py              SQLite 持久化（已见微博、提醒任务、@全体 计数）
-scheduler.py          到点扫描与重启恢复
+scheduler.py          到点扫描、重启恢复、免打扰顺延、周期续期
 pusher.py             推送渲染与发送（含 @全体 四道闸门与失败降级）
 metadata.yaml         插件元信息（含版本号）
 _conf_schema.json     WebUI 配置面板定义

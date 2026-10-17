@@ -123,10 +123,14 @@ def validate(
     items: list[dict[str, Any]],
     body: str,
     base_ts: float,
-    now_ts: float,
     max_future_days: int,
 ) -> list[LLMCandidate]:
-    """四道闸门全过才返回；结果按时间升序去重。"""
+    """四道闸门全过才返回；结果按时间升序去重。
+
+    只校验「相对微博发布时间是否合理」，**不判断是否已过去**——那是主流程
+    `_process_post` 的职责（它要区分「时间已过（静默）」与「没识别出时间（推原文）」，
+    在这里提前过滤会让本该静默的博文走成推原文）。
+    """
     base_dt = datetime.fromtimestamp(base_ts, tz=TZ_CN)
     body_squashed = _squash(body)
     out: list[LLMCandidate] = []
@@ -185,7 +189,7 @@ class LLMFallback:
         except (TypeError, ValueError):
             return 25
 
-    async def extract(self, body: str, base_dt: datetime, now_ts: float) -> list[LLMCandidate]:
+    async def extract(self, body: str, base_dt: datetime) -> list[LLMCandidate]:
         """返回通过校验的候选；任何失败都返回空列表（绝不抛异常）。"""
         if self._ask is None or self.disabled_reason:
             return []
@@ -215,7 +219,7 @@ class LLMFallback:
             max_future_days = int(self.config.get("max_future_days") or 60)
         except (TypeError, ValueError):
             max_future_days = 60
-        candidates = validate(items, body, base_dt.timestamp(), now_ts, max_future_days)
+        candidates = validate(items, body, base_dt.timestamp(), max_future_days)
         dropped = len(items) - len(candidates)
         if dropped:
             self.log.info(f"LLM 给出 {len(items)} 个时间点，{dropped} 个未通过校验被丢弃")

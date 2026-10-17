@@ -54,43 +54,43 @@ def test_parse_response_garbage_returns_empty(text):
 
 
 def test_validate_accepts_real_time():
-    out = validate([_item("2026-10-18 07:28", "7:28")], BODY, BASE_TS, BASE_TS, 60)
+    out = validate([_item("2026-10-18 07:28", "7:28")], BODY, BASE_TS, 60)
     assert len(out) == 1
     assert out[0].source_text == "7:28"
 
 
 def test_validate_rejects_hallucinated_time():
     """闸门 4：引用不在正文里 → 丢弃（LLM 编造时间的典型形态）。"""
-    assert validate([_item("2026-10-18 07:28", "10月24日晚8点")], BODY, BASE_TS, BASE_TS, 60) == []
+    assert validate([_item("2026-10-18 07:28", "10月24日晚8点")], BODY, BASE_TS, 60) == []
 
 
 def test_validate_rejects_empty_source():
-    assert validate([_item("2026-10-18 07:28", "")], BODY, BASE_TS, BASE_TS, 60) == []
+    assert validate([_item("2026-10-18 07:28", "")], BODY, BASE_TS, 60) == []
 
 
 def test_validate_rejects_out_of_range_year():
     """闸门 2：年份越界（如把【1700】读成公元 1700 年）。"""
-    assert validate([_item("1700-01-01 00:00", "7:28")], BODY, BASE_TS, BASE_TS, 60) == []
+    assert validate([_item("1700-01-01 00:00", "7:28")], BODY, BASE_TS, 60) == []
 
 
 def test_validate_rejects_too_far_future():
     """闸门 3：超过 max_future_days。"""
-    assert validate([_item("2027-06-01 10:00", "7:28")], BODY, BASE_TS, BASE_TS, 60) == []
+    assert validate([_item("2027-06-01 10:00", "7:28")], BODY, BASE_TS, 60) == []
 
 
 def test_validate_rejects_time_before_post():
     """闸门 3：早于微博发布时间（容忍 5 分钟）。"""
-    assert validate([_item("2026-10-17 09:00", "7:28")], BODY, BASE_TS, BASE_TS, 60) == []
+    assert validate([_item("2026-10-17 09:00", "7:28")], BODY, BASE_TS, 60) == []
 
 
 def test_validate_rejects_low_confidence():
-    assert validate([_item("2026-10-18 07:28", "7:28", 0.2)], BODY, BASE_TS, BASE_TS, 60) == []
+    assert validate([_item("2026-10-18 07:28", "7:28", 0.2)], BODY, BASE_TS, 60) == []
 
 
 def test_validate_accepts_chinese_date_format():
     body = "10月24日 20:00 直播"
     items = [_item("2026年10月24日 20:00", "10月24日 20:00")]
-    assert len(validate(items, body, BASE_TS, BASE_TS, 60)) == 1
+    assert len(validate(items, body, BASE_TS, 60)) == 1
 
 
 def test_validate_dedupes_and_sorts():
@@ -100,17 +100,14 @@ def test_validate_dedupes_and_sorts():
         _item("2026-10-24 20:00", "10月24日 20:00"),
         _item("2026-10-24 20:00", "10月24日 20:00"),
     ]
-    out = validate(items, body, BASE_TS, BASE_TS, 60)
+    out = validate(items, body, BASE_TS, 60)
     assert [c.source_text for c in out] == ["10月24日 20:00", "10月25日 09:00"]
 
 
 def test_validate_whitespace_insensitive_source_match():
     """正文与引用的换行/空格差异不该被判成编造。"""
     body = "10月24日\n20:00 直播"
-    assert (
-        len(validate([_item("2026-10-24 20:00", "10月24日 20:00")], body, BASE_TS, BASE_TS, 60))
-        == 1
-    )
+    assert len(validate([_item("2026-10-24 20:00", "10月24日 20:00")], body, BASE_TS, 60)) == 1
 
 
 def test_build_user_prompt_contains_post_time_and_body():
@@ -129,7 +126,7 @@ async def test_extract_returns_validated_candidates():
     async def ask(prompt, system):
         return json.dumps({"times": [_item("2026-10-18 07:28", "7:28")]}, ensure_ascii=False)
 
-    out = await _llm({}, ask).extract(BODY, BASE_DT, BASE_TS)
+    out = await _llm({}, ask).extract(BODY, BASE_DT)
     assert len(out) == 1
 
 
@@ -140,7 +137,7 @@ async def test_extract_swallows_call_errors():
         raise RuntimeError("provider 挂了")
 
     llm = _llm({}, ask)
-    assert await llm.extract(BODY, BASE_DT, BASE_TS) == []
+    assert await llm.extract(BODY, BASE_DT) == []
     assert llm.fail_streak == 1
 
 
@@ -156,7 +153,7 @@ async def test_extract_timeout_counted_then_swallowed(monkeypatch):
 
     monkeypatch.setattr("llm_parser.asyncio.wait_for", fake_wait_for)
     llm = _llm({"llm_timeout_seconds": 5}, ask)
-    assert await llm.extract(BODY, BASE_DT, BASE_TS) == []
+    assert await llm.extract(BODY, BASE_DT) == []
     assert llm.fail_streak == 1
 
 
@@ -170,7 +167,7 @@ async def test_extract_disables_after_three_failures():
 
     llm = _llm({}, ask)
     for _ in range(5):
-        await llm.extract(BODY, BASE_DT, BASE_TS)
+        await llm.extract(BODY, BASE_DT)
     assert calls["n"] == 3, "失败 3 次后应停止调用"
 
 
@@ -183,10 +180,10 @@ async def test_extract_resets_streak_after_success():
         return json.dumps({"times": [_item("2026-10-18 07:28", "7:28")]}, ensure_ascii=False)
 
     llm = _llm({}, ask)
-    await llm.extract(BODY, BASE_DT, BASE_TS)
+    await llm.extract(BODY, BASE_DT)
     assert llm.fail_streak == 1
     state["fail"] = False
-    assert len(await llm.extract(BODY, BASE_DT, BASE_TS)) == 1
+    assert len(await llm.extract(BODY, BASE_DT)) == 1
     assert llm.fail_streak == 0
 
 
@@ -199,7 +196,7 @@ async def test_extract_skips_when_disabled_reason_set():
 
     llm = _llm({}, ask)
     llm.disabled_reason = "未找到可用的 LLM provider"
-    assert await llm.extract(BODY, BASE_DT, BASE_TS) == []
+    assert await llm.extract(BODY, BASE_DT) == []
     assert calls["n"] == 0
 
 

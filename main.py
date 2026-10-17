@@ -49,7 +49,7 @@ try:  # 插件在 AstrBot 内以 data.plugins.<name> 包形式加载
         USAGE,
         parse_advance_minutes,
     )
-    from .fetcher import WeiboFetcher, WeiboFetchError, WeiboPost
+    from .fetcher import WeiboCookieExpiredError, WeiboFetcher, WeiboFetchError, WeiboPost
     from .llm_parser import LLMFallback
     from .post_coverage import (
         KIND_LABELS,
@@ -82,6 +82,7 @@ except ImportError:  # 独立脚本 / 测试环境
         parse_advance_minutes,
     )
     from fetcher import (  # type: ignore
+        WeiboCookieExpiredError,
         WeiboFetcher,
         WeiboFetchError,
         WeiboPost,
@@ -368,21 +369,27 @@ class WeiboRemindPlugin(Star):
 
         total_created = 0
         first_error: WeiboFetchError | None = None
-        failed = 0
+        failed_uids: list[str] = []
         for uid in uids:
             try:
                 total_created += await self._check_uid_once(uid)
             except asyncio.CancelledError:
                 raise
             except WeiboFetchError as e:
-                failed += 1
+                failed_uids.append(uid)
                 if first_error is None:
                     first_error = e
-                # 单账号失败不影响其它账号；若触发的是风控冷却，
-                # 后续账号会在冷却检查处快速失败，无害
-                self.logger.warning(f"抓取 uid={uid} 失败（本轮跳过该账号）: {e}")
+                # 单账号失败不影响其它账号；若触发的是风控冷却，后续账号会在
+                # 冷却检查处快速失败。逐账号只记 info，轮末汇总一条 warning——
+                # 否则多账号遇到风控时每轮会打出 N 行同样的错误。
+                self.logger.info(f"抓取 uid={uid} 失败（本轮跳过该账号）: {e}")
                 await self._note_cookie_failure(e)
-        if failed == len(uids) and first_error is not None:
+        if failed_uids:
+            self.logger.warning(
+                f"本轮 {len(failed_uids)}/{len(uids)} 个账号抓取失败"
+                f"（{'、'.join(failed_uids)}），首个错误: {first_error}"
+            )
+        if len(failed_uids) == len(uids) and first_error is not None:
             raise first_error
         self._stats["fetch_rounds"] += 1
         self._stats["last_fetch_ts"] = time.time()
@@ -442,7 +449,7 @@ class WeiboRemindPlugin(Star):
 
         旧行为只有日志里一行错误，群友完全不知道「提醒为什么突然不来了」。
         """
-        if "Cookie 已失效" not in str(error):
+        if not isinstance(error, WeiboCookieExpiredError) and "Cookie 已失效" not in str(error):
             self._cookie_fail_streak = 0
             return
         self._cookie_fail_streak += 1
@@ -535,7 +542,7 @@ class WeiboRemindPlugin(Star):
         candidates = list(result.candidates)
         used_llm = False
         if not candidates and kind.schedule and self.llm is not None:
-            candidates = await self.llm.extract(body, base_dt, now)
+            candidates = await self.llm.extract(body, base_dt)
             used_llm = bool(candidates)
             if used_llm:
                 self._stats["llm_parsed"] += 1
@@ -611,8 +618,8 @@ class WeiboRemindPlugin(Star):
             return 0
         if result.raw_hits and kind.schedule and pending and push_enabled:
             # 排期类 + 明说「时间待定」：时间还没定，推原文让群友知道有这回事
-            await self.pusher.send_parse_fail(post.author, weibo_text, post.link)
-            self._stats["parse_fail_pushed"] += 1
+            if await self.pusher.send_parse_fail(post.author, weibo_text, post.link):
+                self._stats["parse_fail_pushed"] += 1
             self._record_outcome(post, kind, OUTCOME_PUSHED, 0, "时间待定，推原文", weibo_text)
             return 0
         if result.raw_hits:
@@ -621,9 +628,10 @@ class WeiboRemindPlugin(Star):
             self._record_outcome(post, kind, OUTCOME_PAST, 0, reason, weibo_text)
             return 0
         if kind.schedule and push_enabled:
-            await self.pusher.send_parse_fail(post.author, weibo_text, post.link)
-            self._stats["parse_fail_pushed"] += 1
-            self.logger.info(f"{post.id} 排期类博文但未识别出时间，已推送原文供群友确认")
+            pushed = await self.pusher.send_parse_fail(post.author, weibo_text, post.link)
+            if pushed:
+                self._stats["parse_fail_pushed"] += 1
+                self.logger.info(f"{post.id} 排期类博文但未识别出时间，已推送原文供群友确认")
             self._record_outcome(
                 post, kind, OUTCOME_PUSHED, 0, "排期类但未识别出时间", weibo_text, gap=gap
             )
@@ -922,7 +930,7 @@ class WeiboRemindPlugin(Star):
         else:
             lines.append("· 规则层未得到可用时间点")
             if self.llm is not None:
-                llm_cands = await self.llm.extract(text, base_dt, now)
+                llm_cands = await self.llm.extract(text, base_dt)
                 if llm_cands:
                     lines.append("· LLM 兜底（已通过校验）：")
                     for cand in llm_cands:

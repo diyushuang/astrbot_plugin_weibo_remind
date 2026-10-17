@@ -98,6 +98,15 @@ class WeiboRiskError(WeiboFetchError):
     """触发微博 IP 级风控（HTTP 418/432、200 回 HTML），需要全局冷却。"""
 
 
+class WeiboCookieExpiredError(WeiboFetchError):
+    """自定义 Cookie 已失效。
+
+    单独成类是为了让上层能**按类型**判定（而不是匹配错误文案）——
+    「Cookie 过期要提醒用户更换」与「普通网络故障」的处理完全不同，
+    靠字符串匹配一旦改文案就会静默失效。
+    """
+
+
 @dataclass
 class WeiboPost:
     """解析后的一条微博（外层帖）。"""
@@ -429,7 +438,7 @@ class WeiboFetcher:
         if data.get("ok") == -100:
             if self._custom_cookies:
                 # 自定义 Cookie 失效时换新游客身份没有意义，直接报错
-                raise WeiboFetchError("自定义 Cookie 已失效（接口要求登录）")
+                raise WeiboCookieExpiredError("自定义 Cookie 已失效（接口要求登录）")
             raise WeiboAuthError("接口要求登录（ok=-100）")
         if data.get("ok") != 1:
             raise WeiboFetchError(f"接口返回异常 ok={data.get('ok')}")

@@ -39,6 +39,25 @@ def test_detect_daily():
     assert (rec.hour, rec.minute) == (20, 0)
 
 
+@pytest.mark.parametrize("text", ["每天晚8点直播", "每天 20：00 直播", "每日 21:30 掉落"])
+def test_detect_daily_variants(text):
+    rec = detect(text, EVENT)
+    assert rec is not None and rec.kind == "daily"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "每日一图，今天随手拍",
+        "每天不定时掉落，具体看心情",
+        "每天八点直播",  # 纯中文数字，宁可漏续也不误续
+    ],
+)
+def test_daily_without_time_hint_is_not_recurring(text):
+    """「每天」的误判面大：没有明确时刻标记就不认成周期提醒。"""
+    assert detect(text, EVENT) is None
+
+
 @pytest.mark.parametrize("text", ["下周五 20:00 直播", "10月24日 20:00 直播", "周一见", ""])
 def test_detect_none(text):
     assert detect(text, EVENT) is None
